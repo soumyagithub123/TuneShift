@@ -1,0 +1,19 @@
+﻿python.exe : WARNING:root:Coremltools is not installed. If you plan to use a CoreML Saved Model, reinstall basic-pitch 
+with `pip install 'basic-pitch[coreml]'`
+At line:2 char:16
++ cd ..\backend; & .\venv\Scripts\python.exe -W ignore -c "
++                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (WARNING:root:Co...pitch[coreml]'`:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+WARNING:root:tflite-runtime is not installed. If you plan to use a TFLite Model, reinstall basic-pitch with `pip 
+install 'basic-pitch tflite-runtime'` or `pip install 'basic-pitch[tf]'
+WARNING:root:onnxruntime is not installed. If you plan to use an ONNX Model, reinstall basic-pitch with `pip install 
+'basic-pitch[onnx]'`
+2026-09-20 13:34:02.784970: I tensorflow/core/util/port.cc:113] oneDNN custom operations are on. You may see slightly 
+different numerical results due to floating-point round-off errors from different computation orders. To turn them 
+off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+WARNING:tensorflow:From D:\My-project\music\backend\venv\Lib\site-packages\keras\src\losses.py:2976: The name 
+tf.losses.sparse_softmax_cross_entropy is deprecated. Please use tf.compat.v1.losses.sparse_softmax_cross_entropy 
+instead.
+

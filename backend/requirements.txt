@@ -1,0 +1,15 @@
+﻿fastapi
+uvicorn
+python-multipart
+pydub
+librosa
+demucs
+basic-pitch
+pretty_midi
+soundfile
+scipy
+numpy
+openai
+python-dotenv
+setuptools<81
+faster-whisper

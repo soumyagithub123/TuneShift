@@ -1,0 +1,14 @@
+@import "tailwindcss";
+
+body {
+  background-color: #0a0a0a;
+  color: #fafafa;
+}
+
+/* Style for wavesurfer regions to add clear borders */
+::part(region) {
+  border-left: 2px solid #a5b4fc !important; /* light indigo border */
+  border-right: 2px solid #a5b4fc !important;
+  border-top: 1px solid rgba(165, 180, 252, 0.3) !important;
+  border-bottom: 1px solid rgba(165, 180, 252, 0.3) !important;
+}
