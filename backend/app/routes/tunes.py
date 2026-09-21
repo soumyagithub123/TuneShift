@@ -4,16 +4,18 @@ import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
+from starlette.background import BackgroundTask
 
-from app.config import MAX_UPLOAD_BYTES, OUTPUT_DIR, UPLOAD_DIR
+from app.config import MAX_KARAOKE_BYTES, MAX_UPLOAD_BYTES, OUTPUT_DIR, UPLOAD_DIR, WORK_DIR
 from app.schemas import (
-    AiEditRequest, AiEditResponse, EditOps, Instrument, JobStatus, LyricLine, Project,
+    AiEditRequest, AiEditResponse, EditOps, HookCandidate, ImagePromptRequest, Instrument, JobStatus, LyricLine, Project,
     RenderReelRequest, TuneSettings,
 )
-from app.services import assemble, edit, instruments, llm, lyrics, reel, db, storage
+from app.services import assemble, edit, hook, images, instruments, llm, lyrics, reel, db, separation, storage
 from app.services import project as project_store
 from app.services.pipeline import run_pipeline
+from app.services.shell import run
 
 router = APIRouter()
 
@@ -47,6 +49,18 @@ async def _process(
     except Exception as e:
         await db.update_job(job_id, "failed", str(e))
         print(f"Job {job_id} failed: {e}")
+
+
+async def _separate_job(job_id: str):
+    work = project_store.job_dir(job_id)
+    try:
+        await asyncio.to_thread(
+            separation.separate_vocals, separation.karaoke_source(work), work / "karaoke" / "demucs"
+        )
+        await db.update_job(job_id, "completed", "Voice removed")
+    except Exception as e:
+        await db.update_job(job_id, "failed", str(e))
+        print(f"Removing the voice for {job_id} failed: {e}")
 
 
 def _get_project(job_id: str) -> Project:
@@ -167,6 +181,63 @@ def ai_edit_project(job_id: str, body: AiEditRequest):
     return AiEditResponse(project=_apply_and_render(project, ops), reply=reply)
 
 
+@router.post("/analyze/hook", response_model=dict[str, list[HookCandidate]])
+def analyze_hook(file: UploadFile = File(...)):
+    """Suggest the best 15, 30 and 60 second parts of an uploaded (already down-sampled) song."""
+    if file.size is not None and file.size > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail=f"File too large. Max {MAX_UPLOAD_BYTES // (1024 * 1024)}MB.")
+    path = UPLOAD_DIR / f"hook_{uuid.uuid4()}.wav"
+    with open(path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    try:
+        return hook.find_hooks(path)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not analyse this audio: {e}")
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@router.post("/images/generate")
+def generate_image(body: ImagePromptRequest):
+    """One cheap AI picture for a clip's background."""
+    if not llm.available():
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not set in backend/.env")
+    if body.aspect not in reel.SIZES:
+        raise HTTPException(status_code=400, detail=f"Unknown size '{body.aspect}'.")
+    try:
+        data = images.generate(body.prompt, body.aspect)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Image request failed: {e}")
+    return Response(content=data, media_type="image/jpeg")
+
+
+@router.post("/clips/convert")
+def convert_clip(video: UploadFile = File(...)):
+    """Turn the browser's recording (WebM or a fragmented MP4) into a standard MP4 that plays everywhere."""
+    if video.size is not None and video.size > MAX_KARAOKE_BYTES:
+        raise HTTPException(status_code=400, detail=f"Video too large. Max {MAX_KARAOKE_BYTES // (1024 * 1024)}MB.")
+    work = WORK_DIR / "clips" / str(uuid.uuid4())
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        source = work / "recording"
+        with open(source, "wb") as buffer:
+            shutil.copyfileobj(video.file, buffer)
+        out = work / "clip.mp4"
+        run([
+            "ffmpeg", "-y", "-i", str(source),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-r", "30", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(out),
+        ])
+    except Exception as e:
+        shutil.rmtree(work, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Could not convert the video: {e}")
+    # The clip is not kept: the temporary folder is deleted once the file has been sent.
+    return FileResponse(
+        out, media_type="video/mp4", filename="lyrics_clip.mp4",
+        background=BackgroundTask(shutil.rmtree, work, ignore_errors=True),
+    )
+
+
 @router.get("/reels/{job_id}/lyrics", response_model=list[LyricLine])
 def get_reel_lyrics(job_id: str):
     try:
@@ -176,6 +247,39 @@ def get_reel_lyrics(job_id: str):
     if lines is None:
         raise HTTPException(status_code=404, detail="Reel not found")
     return lines
+
+
+@router.post("/reels/{job_id}/separate", response_model=JobStatus)
+async def separate_reel(job_id: str, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+    """Remove the voice from a finished lyrics job's part. The part is sent again at full quality."""
+    try:
+        work = project_store.job_dir(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if lyrics.load_lines(work) is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if separation.instrumental_path(work).exists():
+        return JobStatus(job_id=job_id, status="completed", message="Voice removed")
+    if file.size is not None and file.size > MAX_KARAOKE_BYTES:
+        raise HTTPException(status_code=400, detail=f"Part too large. Max {MAX_KARAOKE_BYTES // (1024 * 1024)}MB.")
+    source = separation.karaoke_source(work)
+    source.parent.mkdir(parents=True, exist_ok=True)
+    with open(source, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    await db.update_job(job_id, "processing", "Removing the voice...")
+    background_tasks.add_task(_separate_job, job_id)
+    return JobStatus(job_id=job_id, status="processing", message="Removing the voice...")
+
+
+@router.get("/reels/{job_id}/instrumental")
+def get_instrumental(job_id: str):
+    try:
+        path = separation.instrumental_path(project_store.job_dir(job_id))
+    except ValueError:
+        path = None
+    if path is None or not path.exists():
+        raise HTTPException(status_code=404, detail="This part was not separated into voice and music")
+    return FileResponse(path, media_type="audio/wav", headers={"Cache-Control": "no-store"})
 
 
 @router.post("/reels/{job_id}/render")

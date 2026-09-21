@@ -23,6 +23,17 @@ class LyricLine(BaseModel):
     text: str = Field(max_length=200)
 
 
+class ImagePromptRequest(BaseModel):
+    prompt: str = Field(min_length=3, max_length=500)
+    aspect: str = "9:16"
+
+
+class HookCandidate(BaseModel):
+    start: float
+    end: float
+    score: float
+
+
 class RenderReelRequest(BaseModel):
     lines: list[LyricLine] = Field(max_length=200)
 

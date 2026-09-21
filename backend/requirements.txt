@@ -13,3 +13,4 @@ openai
 python-dotenv
 setuptools<81
 faster-whisper
+unidecode

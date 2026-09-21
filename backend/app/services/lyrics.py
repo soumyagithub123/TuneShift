@@ -1,4 +1,6 @@
 import json
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,26 +64,89 @@ def _transcribe_local(vocals_wav: Path, language: str | None) -> tuple[list[Word
     return words, (info.language or "").lower()
 
 
-def transcribe_words(vocals_wav: Path, language: str | None = None) -> list[Word]:
-    """Word timestamps for the sung vocals; empty if nothing is recognised.
+# Whisper skips stretches of sung audio (a 50 s clip lost 30 s of lyrics) and is not deterministic: the
+# same window can come back empty once and full the next time. So the audio is transcribed in short
+# overlapping windows, stitched back together, and a window that comes back empty is retried.
+WINDOW_SEC = 8.0
+WINDOW_OVERLAP = 2.0
+SILENT_RMS = 0.003  # windows quieter than this are skipped so Whisper doesn't invent text for silence
+MAX_PARALLEL = 8
+EMPTY_RETRIES = 2
+
+
+def _windows(total: float) -> list[tuple[float, float]]:
+    out, start = [], 0.0
+    while True:
+        end = min(start + WINDOW_SEC, total)
+        out.append((start, end))
+        if end >= total:
+            return out
+        start += WINDOW_SEC - WINDOW_OVERLAP
+
+
+def transcribe_words(source_wav: Path, language: str | None = None) -> tuple[list[Word], str | None]:
+    """Word timestamps for the sung audio (empty if nothing is recognised) and the language used.
 
     Uses the OpenAI Whisper API when a key is configured (much faster than CPU Whisper),
-    otherwise a local faster-whisper model. With `language=None` the language is auto-detected,
-    but Whisper labels Indian songs unreliably (Urdu, Punjabi, ...), so anything not detected as
-    English is re-run as Hindi.
+    otherwise a local faster-whisper model. With `language=None` the language is auto-detected
+    for the whole song: English stays English; anything else is transcribed as Hindi, because
+    Whisper labels Indian songs unreliably (Urdu, Punjabi, ...).
     """
-    def run_once(lang: str | None) -> tuple[list[Word], str]:
-        if OPENAI_API_KEY:
-            try:
-                return _transcribe_openai(vocals_wav, lang)
-            except Exception as e:
-                print(f"OpenAI transcription failed, falling back to local model: {e}")
-        return _transcribe_local(vocals_wav, lang)
+    import soundfile as sf
 
-    words, detected = run_once(language)
-    if language is None and detected not in ("english", "en"):
-        words, _ = run_once("hi")
-    return words
+    audio, sr = sf.read(str(source_wav), dtype="float32", always_2d=True)
+    mono = audio.mean(axis=1)
+    windows = _windows(len(mono) / sr)
+
+    jobs: list[tuple[int, float, float, Path]] = []
+    for k, (start, end) in enumerate(windows):
+        chunk = mono[int(start * sr) : int(end * sr)]
+        if len(chunk) == 0 or float((chunk**2).mean() ** 0.5) < SILENT_RMS:
+            continue
+        path = source_wav.with_name(f"{source_wav.stem}.w{k}.wav")
+        sf.write(str(path), chunk, sr)
+        jobs.append((k, start, end, path))
+
+    def run_once(path: Path, lang: str | None) -> tuple[list[Word], str]:
+        for _attempt in range(1 + EMPTY_RETRIES):
+            if OPENAI_API_KEY:
+                try:
+                    res = _transcribe_openai(path, lang)
+                except Exception as e:
+                    print(f"OpenAI transcription failed, falling back to local model: {e}")
+                    res = _transcribe_local(path, lang)
+            else:
+                res = _transcribe_local(path, lang)
+            if res[0]:
+                break
+        return res
+
+    workers = MAX_PARALLEL if OPENAI_API_KEY else 1
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(lambda j: run_once(j[3], language), jobs))
+
+        final = language
+        if language is None and results:
+            english = sum(len(w) for w, d in results if d in ("english", "en"))
+            other = sum(len(w) for w, d in results if d not in ("english", "en"))
+            final = "en" if english > other else "hi"
+            ok = ("english", "en") if final == "en" else ("hindi", "hi")
+            redo = [i for i, (_w, d) in enumerate(results) if d not in ok]
+            for i, res in zip(redo, pool.map(lambda i: run_once(jobs[i][3], final), redo)):
+                results[i] = res
+
+    words: list[Word] = []
+    last = len(windows) - 1
+    for (k, start, _end, path), (chunk_words, _d) in zip(jobs, results):
+        # In the overlap keep each word from the window where it sits nearest the middle.
+        lo = start + WINDOW_OVERLAP / 2 if k > 0 else 0.0
+        hi = windows[k][1] - WINDOW_OVERLAP / 2 if k < last else float("inf")
+        for w in chunk_words:
+            if lo <= start + w.start < hi:
+                words.append(Word(start + w.start, start + w.end, w.text))
+        for f in (path, path.with_name(f"{path.stem}.upload.mp3")):
+            f.unlink(missing_ok=True)
+    return words, final
 
 
 def group_lines(
@@ -109,8 +174,8 @@ ROMANIZE_SYSTEM = (
     "written in Devanagari or Arabic script (for example a Devanagari 'baby'), become normal English spelling "
     "('baby'). This is transliteration, NOT translation: never translate any word into another language, "
     "never change the meaning, and never add, drop, merge, split or reorder words or lines. If a word is "
-    "unclear, romanize it as heard. The output must contain only Latin letters, no Devanagari, Arabic or "
-    "other scripts. Reply with JSON only: {\"lines\": [<string>, ...]} with exactly as many strings as the input."
+    "unclear, romanize it as heard. Use ONLY plain ASCII letters a-z: no Devanagari, Arabic or other "
+    "scripts, and no accents or diacritics (write 'a' not 'ā', 'r' not 'ṛ', 'n' not 'ñ'). Reply with JSON only: {\"lines\": [<string>, ...]} with exactly as many strings as the input."
 )
 ROMANIZE_CHUNK = 40
 
@@ -119,42 +184,56 @@ def _has_non_latin(text: str) -> bool:
     return any(c.isalpha() and not c.isascii() for c in text)
 
 
-def _romanize_chunk(texts: list[str]) -> list[str] | None:
+def _ascii(text: str) -> str:
+    """Strip accents (ā -> a, ṛ -> r) so the model's Roman spelling is plain English letters."""
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+def _romanize_texts(texts: list[str], attempts: int) -> list[str] | None:
     from app.services import llm
 
-    for _attempt in range(2):
+    for _attempt in range(attempts):
         try:
             data = llm.ask_json(ROMANIZE_SYSTEM, json.dumps({"lines": texts}, ensure_ascii=False))
         except Exception as e:
             print(f"Romanizing failed: {e}")
             continue
         out = data.get("lines")
-        if (
-            isinstance(out, list)
-            and len(out) == len(texts)
-            and all(isinstance(t, str) for t in out)
-            and not any(_has_non_latin(t) for t in out)
-        ):
-            return [t.strip() for t in out]
+        if not (isinstance(out, list) and len(out) == len(texts) and all(isinstance(t, str) for t in out)):
+            continue
+        out = [_ascii(t).strip() for t in out]
+        if not any(_has_non_latin(t) for t in out):
+            return out
     return None
+
+
+def _force_latin(text: str) -> str:
+    """Last resort: mechanical transliteration, so no Hindi/Urdu script is ever shown."""
+    from unidecode import unidecode
+
+    return " ".join(unidecode(text).split())
 
 
 def to_hinglish(lines: list[LyricLine]) -> list[LyricLine]:
     """Write lines that came out in Devanagari/Urdu script with English letters, keeping timings.
 
-    Lines that are already in Latin letters (e.g. an English song) are left exactly as heard so they
-    can never be translated. Without an OpenAI key, or if the model's reply does not line up with the
-    input, the original text is kept.
+    Lines already in Latin letters (e.g. an English song) are left exactly as heard so they can never
+    be translated. Lines in another script are romanized by the model (whole batch, then line by line)
+    and, if that still fails, by a mechanical transliteration, so the result is always Latin letters.
     """
-    if not OPENAI_API_KEY:
-        return lines
     todo = [i for i, l in enumerate(lines) if _has_non_latin(l.text)]
     out = list(lines)
     for c in range(0, len(todo), ROMANIZE_CHUNK):
         idx = todo[c : c + ROMANIZE_CHUNK]
-        texts = _romanize_chunk([lines[i].text for i in idx])
+        texts = _romanize_texts([lines[i].text for i in idx], attempts=3) if OPENAI_API_KEY else None
+        if texts is None and OPENAI_API_KEY:
+            texts = []
+            for i in idx:
+                one = _romanize_texts([lines[i].text], attempts=2)
+                texts.append(one[0] if one else _force_latin(lines[i].text))
         if texts is None:
-            continue
+            texts = [_force_latin(lines[i].text) for i in idx]
         for i, t in zip(idx, texts):
             out[i] = LyricLine(start=lines[i].start, end=lines[i].end, text=t)
     return out

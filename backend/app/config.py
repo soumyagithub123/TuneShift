@@ -14,9 +14,11 @@ OUTPUT_DIR = STORAGE_DIR / "outputs"
 SOUNDFONT_DIR = BASE_DIR / "soundfonts"
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+MAX_KARAOKE_BYTES = 120 * 1024 * 1024  # a full-quality stereo part, only ever sent from this machine
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1-mini")  # the cheapest image model
 
 ALLOWED_ORIGINS = os.getenv(
     "ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"

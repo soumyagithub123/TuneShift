@@ -37,7 +37,7 @@ def run_pipeline(
             on_status("Separating vocals (this takes a while)...")
             source = separation.separate_vocals(trimmed, work / "demucs")
         on_status("Finding lyrics timing...")
-        words = lyrics.transcribe_words(source, language)
+        words, _spoken = lyrics.transcribe_words(source, language)
         lines = lyrics.group_lines(words, max_words=8, max_gap=0.8)
         on_status("Converting to Hinglish...")
         lyrics.save_lines(work, lyrics.to_hinglish(lines))
@@ -57,7 +57,7 @@ def run_pipeline(
     if settings.mode == "reel":
         no_vocals = vocals.parent / "no_vocals.wav"
         on_status("Finding lyrics timing...")
-        lines = lyrics.group_lines(lyrics.transcribe_words(vocals, language))
+        lines = lyrics.group_lines(lyrics.transcribe_words(vocals, language)[0])
         lyrics.save_lines(work, lines)
         return reel.render_reel(job_id, no_vocals, image_path, on_status)
 
