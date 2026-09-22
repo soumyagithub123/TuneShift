@@ -47,7 +47,7 @@ def _transcribe_local(vocals_wav: Path, language: str | None) -> tuple[list[Word
     if _local_model is None:
         from faster_whisper import WhisperModel
 
-        _local_model = WhisperModel("small", device="cpu", compute_type="int8")
+        _local_model = WhisperModel("tiny", device="cpu", compute_type="int8")
     segments, info = _local_model.transcribe(
         str(vocals_wav),
         language=language,
