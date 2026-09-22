@@ -1,6 +1,6 @@
-﻿.env
+.env
 venv/
 __pycache__/
 storage/
 bin/
-soundfonts/*.sf2
+soundfonts/harmonium.sf2
