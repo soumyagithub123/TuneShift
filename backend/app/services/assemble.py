@@ -11,9 +11,29 @@ MIN_NOTE_SECONDS = 0.1
 BASS_PROGRAM = 32
 CHORD_PROGRAM = {"block": 48, "arpeggio": 46, "strum": 25}
 
+# Reed/drone instruments sustain through short breaths in the sung melody instead of
+# clicking off between notes, so we stretch each note to meet the next one when the
+# gap is small. Longer gaps are real pauses and stay silent.
+# 0.22s comes from a real harmonium reference clip: basic_pitch found gaps up to that
+# length between consecutive notes, with none of them being an actual silent pause.
+LEGATO_INSTRUMENTS = {"harmonium", "organ", "accordion"}
+LEGATO_MAX_GAP = 0.22
+
 
 def _clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
+
+
+def _apply_legato(notes: list[tuple[int, float, float, int]], max_gap: float):
+    notes = sorted(notes, key=lambda n: n[1])
+    out = []
+    for i, (pitch, start, end, velocity) in enumerate(notes):
+        if i + 1 < len(notes):
+            gap = notes[i + 1][1] - end
+            if 0 < gap <= max_gap:
+                end = notes[i + 1][1]
+        out.append((pitch, start, end, velocity))
+    return out
 
 
 def _chord_notes(chord: Chord, style: str, volume: float):
@@ -66,13 +86,18 @@ def build_midi(project: Project) -> pretty_midi.PrettyMIDI:
         )
 
     lead = pretty_midi.Instrument(program=instruments.program_for(project.instrument), name="lead")
+    lead_notes = []
     for inst in source.instruments:
         for n in inst.notes:
             if project.note_smoothing and n.end - n.start < MIN_NOTE_SECONDS:
                 continue
-            add(lead, n.pitch, n.start, n.end, int(n.velocity * project.melody_volume))
+            lead_notes.append((n.pitch, n.start, n.end, int(n.velocity * project.melody_volume)))
         if project.pitch_bend:
             lead.pitch_bends.extend(b for b in inst.pitch_bends if not muted(b.time))
+    if project.instrument in LEGATO_INSTRUMENTS:
+        lead_notes = _apply_legato(lead_notes, LEGATO_MAX_GAP)
+    for note in lead_notes:
+        add(lead, *note)
     out.instruments.append(lead)
 
     if project.accompaniment and project.accompaniment_volume > 0 and project.chords:

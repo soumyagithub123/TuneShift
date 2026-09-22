@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Callable
 
 from app.schemas import Project, TuneSettings
-from app.services import assemble, audio, compose, instruments, lyrics, melody, reel, separation
+from app.services import assemble, audio, compose, instruments, lyrics, melody, reel, remix, separation, voice
 from app.services import project as project_store
 from app.config import OUTPUT_DIR
 from pydub import AudioSegment, effects
@@ -31,6 +31,13 @@ def run_pipeline(
     trimmed = work / "trimmed.wav"
     duration = audio.trim_to_wav(input_file, start_sec, length_sec, trimmed)
 
+    if settings.mode == "swap":
+        return remix.swap_instrument(trimmed, work, instrument, settings, job_id, on_status)
+    if settings.mode == "lofi":
+        return remix.lofi(trimmed, work, settings, job_id, on_status)
+    if settings.mode == "voice":
+        return voice.convert_voice(trimmed, work, settings.voice_character, job_id, on_status)
+
     if settings.mode == "lyrics":
         source = trimmed
         if settings.isolate_vocals or duration <= LYRICS_ISOLATE_MAX_SEC:
@@ -46,13 +53,19 @@ def run_pipeline(
     on_status("Separating vocals (this takes a while)...")
     vocals = separation.separate_vocals(trimmed, work / "demucs")
 
-    if settings.mode == "remove_voice":
-        on_status("Finalizing accompaniment track...")
-        no_vocals = vocals.parent / "no_vocals.wav"
-        audio_seg = AudioSegment.from_file(str(no_vocals))
+    def _export_stem(stem_path: Path) -> Path:
+        audio_seg = AudioSegment.from_file(str(stem_path))
         out_mp3 = OUTPUT_DIR / f"{job_id}.mp3"
         effects.normalize(audio_seg, headroom=1.0).export(str(out_mp3), format="mp3")
         return out_mp3
+
+    if settings.mode == "remove_voice":
+        on_status("Finalizing accompaniment track...")
+        return _export_stem(vocals.parent / "no_vocals.wav")
+
+    if settings.mode == "vocals_only":
+        on_status("Finalizing vocal track...")
+        return _export_stem(vocals)
 
     if settings.mode == "reel":
         no_vocals = vocals.parent / "no_vocals.wav"

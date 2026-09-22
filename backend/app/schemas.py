@@ -13,8 +13,19 @@ class TuneSettings(BaseModel):
     note_smoothing: bool = False
     pitch_bend: bool = False
     tempo: float = Field(1.0, ge=0.5, le=2.0)
-    mode: Literal["remove_voice", "compose", "reel", "lyrics"] = "compose"
+    mode: Literal["remove_voice", "vocals_only", "compose", "reel", "lyrics", "swap", "lofi", "voice"] = "compose"
     isolate_vocals: bool = False  # lyrics mode: run vocal separation first (slower, better on loud mixes)
+    # swap mode: which parts of the original song stay
+    keep_drums: bool = True
+    keep_bass: bool = True
+    keep_vocals: bool = False
+    # lofi mode
+    lofi_speed: float = Field(0.88, ge=0.7, le=1.0)
+    lofi_vinyl: bool = True
+    lofi_reverb: bool = True
+    lofi_remove_vocals: bool = False
+    # voice mode: which character to turn the singer into
+    voice_character: str = "chipmunk"
 
 
 class LyricLine(BaseModel):
@@ -42,6 +53,11 @@ class Instrument(BaseModel):
     id: str
     name: str
     program: int
+
+
+class VoiceCharacter(BaseModel):
+    id: str
+    name: str
 
 
 Style = Literal["block", "arpeggio", "strum"]
@@ -93,3 +109,24 @@ class AiEditRequest(BaseModel):
 class AiEditResponse(BaseModel):
     project: Project
     reply: str
+
+
+class InstrumentRequest(BaseModel):
+    instrument: str
+
+
+class KaraokeTweakRequest(BaseModel):
+    mode: Literal["remove_voice", "vocals_only"]
+    pitch: int = Field(0, ge=-12, le=12)
+    tempo: float = Field(1.0, ge=0.5, le=2.0)
+
+
+class RenameJobRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=200)
+
+
+class ExportMixRequest(BaseModel):
+    music: float = Field(1.0, ge=0, le=1)
+    drums: float = Field(1.0, ge=0, le=1)
+    bass: float = Field(1.0, ge=0, le=1)
+    vocals: float = Field(0.0, ge=0, le=1)

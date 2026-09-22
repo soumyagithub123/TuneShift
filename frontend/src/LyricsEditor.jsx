@@ -4,7 +4,7 @@ import RegionsPlugin from 'wavesurfer.js/dist/plugins/regions.esm.js';
 import { FONTS, loadFont } from './clip/fonts';
 import { ANIMATIONS, DEFAULT_CLIP, SIZES, drawClipFrame } from './clip/clipRenderer';
 import { canRecord, recordClip } from './clip/recordClip';
-import { ArrowLeft, Upload, Play, Pause, Loader2, Check, Download, Languages, Scissors, Sparkles, RotateCcw, Plus, X, MicOff, Film, Image as ImageIcon, ChevronDown, ArrowUp } from 'lucide-react';
+import { ArrowLeft, Upload, Play, Pause, Loader2, Check, Download, Languages, Scissors, Sparkles, RotateCcw, Plus, X, Film, Image as ImageIcon, ChevronDown, ArrowUp, Maximize, Minimize } from 'lucide-react';
 
 const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
@@ -24,6 +24,10 @@ const HOOK_PREVIEW_SEC = 15; // how long a click on a hook dot plays
 const MIN_REGION = 1;
 const MIN_LINE = 0.3; // shortest a lyric line can be made on the timeline
 const clampTo = (v, lo, hi) => Math.min(Math.max(v, lo), Math.max(lo, hi));
+
+const PANEL_DEFAULT = { left: 320, right: 384 };
+const PANEL_LIMITS = { left: [240, 520], right: [280, 560] }; // [min, max] width in px
+const PANEL_CENTER_MIN = 420;
 
 const formatTime = (sec) => {
   if (!Number.isFinite(sec) || sec < 0) sec = 0;
@@ -213,24 +217,43 @@ function Slider({ label, value, min, max, step, onChange, format }) {
 }
 
 // Uncontrolled on purpose: the key re-syncs it when the region is dragged, and typing isn't interrupted.
+// A thin drag bar on the edge between two panels. Double-click puts the panel back to its normal width.
+function PanelResizer({ onStart, onMove, onEnd, onReset }) {
+  return (
+    <div className="relative w-0 z-20">
+      <div
+        onPointerDown={onStart} onPointerMove={onMove} onPointerUp={onEnd} onPointerCancel={onEnd} onDoubleClick={onReset}
+        className="absolute inset-y-0 -left-1 w-2 cursor-col-resize touch-none hover:bg-indigo-500/40 active:bg-indigo-500/60 transition-colors"
+        title="Drag to change the width (double-click to reset)"
+      />
+    </div>
+  );
+}
+
 function TimeField({ label, value, disabled, onCommit }) {
   return (
-    <label className="flex items-center gap-1.5">
-      <span className="text-[10px] text-zinc-500">{label}</span>
+    <label className="block min-w-0">
+      <span className="block text-[10px] text-zinc-500 mb-1">{label}</span>
       <input
         key={value.toFixed(1)}
         type="number" step="0.1" min="0" defaultValue={value.toFixed(1)}
         disabled={disabled}
         onBlur={(e) => onCommit(parseFloat(e.target.value) || 0)}
         onKeyDown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
-        className="w-16 bg-zinc-900 border border-zinc-800 rounded-md px-2 py-1 text-xs font-mono text-zinc-200 disabled:opacity-40 focus:outline-none focus:border-indigo-500"
+        className="w-full bg-zinc-900 border border-zinc-800 rounded-md px-2 py-1.5 text-xs font-mono text-zinc-200 disabled:opacity-40 focus:outline-none focus:border-indigo-500"
       />
     </label>
   );
 }
 
-export default function LyricsEditor({ onBack }) {
+// `auto` is "Hook to Reel": once a song is chosen, the best part, the lyrics and a picture are made for the user.
+export default function LyricsEditor({ onBack, auto = false }) {
   const [file, setFile] = useState(null);
+  const [autoStep, setAutoStep] = useState(null); // hook | choose | go | lyrics | image | done (null when not running)
+  const [hookLen, setHookLen] = useState(HOOK_KEY); // which hook length is offered
+  // Hook to Reel shows a small guided screen on top of the studio until the reel is made. The studio stays
+  // underneath (it holds the player and the drawing) and is shown once the reel is ready.
+  const wizard = auto && autoStep !== 'done';
   const [duration, setDuration] = useState(0);
   const [region, setRegion] = useState({ start: 0, end: 0 });
 
@@ -268,6 +291,46 @@ export default function LyricsEditor({ onBack }) {
   const exportAbortRef = useRef(null);
   const imageElRef = useRef(null); // the picture as an <img>, for drawing on the canvas
   const previewCanvasRef = useRef(null);
+  const clipBoxRef = useRef(null); // the clip preview and its controls, the part that goes full screen
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  // Widths of the side panels. Dragging their edges changes them; they are remembered in this browser.
+  const [panelW, setPanelW] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('lyrics-panel-widths'));
+      return {
+        left: clampTo(Number(saved?.left) || PANEL_DEFAULT.left, PANEL_LIMITS.left[0], PANEL_LIMITS.left[1]),
+        right: clampTo(Number(saved?.right) || PANEL_DEFAULT.right, PANEL_LIMITS.right[0], PANEL_LIMITS.right[1]),
+      };
+    } catch {
+      return { ...PANEL_DEFAULT };
+    }
+  });
+  const resizeRef = useRef(null);
+  useEffect(() => {
+    try {
+      localStorage.setItem('lyrics-panel-widths', JSON.stringify(panelW));
+    } catch { /* remembering the widths is optional */ }
+  }, [panelW]);
+  const startResize = (side) => (e) => {
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    resizeRef.current = { side, startX: e.clientX, startW: panelW[side] };
+  };
+  const moveResize = (e) => {
+    const r = resizeRef.current;
+    if (!r) return;
+    const dx = e.clientX - r.startX;
+    const [lo, hi] = PANEL_LIMITS[r.side];
+    const other = panelW[r.side === 'left' ? 'right' : 'left'];
+    const room = window.innerWidth - other - PANEL_CENTER_MIN; // the centre always keeps some width
+    const w = clampTo(r.side === 'left' ? r.startW + dx : r.startW - dx, lo, Math.min(hi, room));
+    setPanelW((p) => ({ ...p, [r.side]: w }));
+  };
+  const endResize = () => {
+    resizeRef.current = null;
+  };
+  const resetPanel = (side) => () => setPanelW((p) => ({ ...p, [side]: PANEL_DEFAULT[side] }));
 
   const waveformRef = useRef(null);
   const wsRef = useRef(null);
@@ -403,7 +466,7 @@ export default function LyricsEditor({ onBack }) {
 
   useEffect(() => {
     const onKey = (e) => {
-      if (e.code === 'Space' && !isTyping(e.target)) {
+      if (e.code === 'Space' && !wizard && !isTyping(e.target)) {
         e.preventDefault();
         togglePlay();
       }
@@ -572,6 +635,7 @@ export default function LyricsEditor({ onBack }) {
   const backToFullSong = () => {
     if (lines.length > 0 && !window.confirm('Going back clears the lyrics. Continue?')) return;
     restoreRegionRef.current = lastPartRef.current;
+    setAutoStep(auto ? 'choose' : null);
     setCenterTab('lyrics');
     viewOffsetRef.current = 0;
     setFile(originalFile);
@@ -582,6 +646,7 @@ export default function LyricsEditor({ onBack }) {
 
   const pickFile = (f) => {
     if (!f) return;
+    setAutoStep(auto ? 'hook' : null);
     setOriginalFile(f);
     viewOffsetRef.current = 0;
     lastPartRef.current = null;
@@ -659,6 +724,17 @@ export default function LyricsEditor({ onBack }) {
   };
   const resetTextPosition = () => setClip((c) => ({ ...c, posX: DEFAULT_CLIP.posX, posY: DEFAULT_CLIP.posY }));
 
+  // Full screen for the clip preview (Esc leaves it). The state follows the browser, so Esc keeps the button right.
+  useEffect(() => {
+    const sync = () => setIsFullscreen(document.fullscreenElement === clipBoxRef.current);
+    document.addEventListener('fullscreenchange', sync);
+    return () => document.removeEventListener('fullscreenchange', sync);
+  }, []);
+  const toggleFullscreen = () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else clipBoxRef.current?.requestFullscreen?.().catch(() => {});
+  };
+
   const imagePreview = useMemo(() => (imageFile ? URL.createObjectURL(imageFile) : null), [imageFile]);
   useEffect(() => () => {
     if (imagePreview) URL.revokeObjectURL(imagePreview);
@@ -719,12 +795,13 @@ export default function LyricsEditor({ onBack }) {
   };
 
   // Describe a picture: the description and the drawn picture join the conversation, and it is used right away.
-  const generateImage = async () => {
-    const prompt = imagePrompt.trim();
+  // `given` is a description written by the app (Hook to Reel); from the button it is the click event.
+  const generateImage = async (given) => {
+    const prompt = (typeof given === 'string' ? given : imagePrompt).trim();
     if (prompt.length < 3 || imageBusy) return;
     const busyId = chatId();
     setChat((c) => [...c, { id: chatId(), kind: 'prompt', text: prompt }, { id: busyId, kind: 'busy' }]);
-    setImagePrompt('');
+    if (typeof given !== 'string') setImagePrompt('');
     setImageBusy(true);
     try {
       const res = await fetch(`${API}/images/generate`, {
@@ -742,6 +819,58 @@ export default function LyricsEditor({ onBack }) {
       setImageBusy(false);
     }
   };
+
+  // ---- Hook to Reel: the steps run one after the other, each waiting for the one before ----
+  // 1. Once the hooks are known, the window is put on the best one (or the first 30 seconds if none was found)
+  // and the user chooses: another hook, or their own part on the timeline. "Make my reel" goes on from there.
+  useEffect(() => {
+    if (!auto || autoStep !== 'hook' || !duration) return;
+    if (hookState === 'ready' || hookState === 'failed') {
+      const best = hooks?.[HOOK_KEY]?.[0];
+      setHookLen(HOOK_KEY);
+      if (best) applyRegion(best.start, best.end);
+      else applyRegion(0, Math.min(duration, 30));
+      setAutoStep('choose');
+    }
+  }, [auto, autoStep, hookState, hooks, duration]);
+
+  const chooseHook = (h) => {
+    applyRegion(h.start, h.end);
+    previewHook(h.start);
+  };
+  const chooseHookLength = (key) => {
+    setHookLen(key);
+    const first = hooks?.[key]?.[0];
+    if (first) applyRegion(first.start, first.end);
+  };
+
+  // 2. Make the lyrics of that window (the window is already in place on this render).
+  useEffect(() => {
+    if (autoStep !== 'go') return;
+    setAutoStep('lyrics');
+    handleGenerate();
+  }, [autoStep]);
+
+  // 3. With the lyrics ready, draw a picture that fits them. Without a picture the clip still has its gradient.
+  useEffect(() => {
+    if (autoStep !== 'lyrics') return;
+    if (phase === 'error') {
+      setAutoStep(null);
+      return;
+    }
+    if (phase !== 'done') return;
+    const text = lines.map((l) => l.text.trim()).filter(Boolean);
+    if (text.length === 0) {
+      setAutoStep(null);
+      return;
+    }
+    setAutoStep('image');
+    const prompt = `A cinematic, atmospheric scene that matches the mood of these song lyrics: ${text.slice(0, 6).join(' / ')}`;
+    generateImage(prompt.slice(0, 480)).finally(() => {
+      setCenterTab('clip');
+      setAutoStep('done');
+    });
+  }, [autoStep, phase, lines]);
 
   // Keep the newest message in view, close the "Adjust" box when clicking elsewhere, and free the pictures at the end.
   useEffect(() => {
@@ -953,21 +1082,145 @@ export default function LyricsEditor({ onBack }) {
   const activeStep = stepIndexFor(statusMsg);
 
   const trimLocked = !file || phase === 'generating';
-  const hookList = file && file === originalFile ? hooks?.[HOOK_KEY] ?? [] : [];
+  const hookList = file && file === originalFile ? hooks?.[hookLen] ?? [] : [];
   const showHookStatus = file && file === originalFile;
   // A clip needs generated lyrics: the audio is then the generated part, which the lines match.
   const clipReady = Boolean(file && originalFile && file !== originalFile && lines.some((l) => l.text.trim()));
 
+  const working = autoStep === 'go' || autoStep === 'lyrics' || autoStep === 'image';
+  const wizardView = wizard && (
+    <div className="fixed inset-0 z-50 bg-[#0b0b0d] text-zinc-100 font-sans flex flex-col">
+      <header className="h-12 shrink-0 border-b border-zinc-800 bg-[#111113] flex items-center gap-3 px-4">
+        <button onClick={onBack} className="p-1.5 rounded-md text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors" title="Back">
+          <ArrowLeft className="w-4 h-4" />
+        </button>
+        <Sparkles className="w-4 h-4 text-fuchsia-400" />
+        <span className="text-sm font-semibold">Hook to Reel</span>
+      </header>
+
+      <main className="flex-1 min-h-0 overflow-y-auto p-6 flex items-center justify-center">
+        <div className="w-full max-w-md">
+          {!file || (!autoStep && phase === 'idle') ? (
+            <label
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => { e.preventDefault(); pickFile(e.dataTransfer.files[0]); }}
+              className="block border-2 border-dashed border-zinc-700 hover:border-fuchsia-500/60 rounded-2xl p-10 text-center cursor-pointer transition-colors"
+            >
+              <Upload className="w-9 h-9 text-zinc-600 mx-auto mb-3" />
+              <p className="text-zinc-200 font-medium">Drop a song here or click to choose</p>
+              <p className="text-sm text-zinc-500 mt-1">MP3 or WAV</p>
+              <input type="file" accept="audio/*" className="hidden" onChange={(e) => pickFile(e.target.files[0])} />
+            </label>
+          ) : autoStep === 'hook' ? (
+            <div className="text-center space-y-2">
+              <Loader2 className="w-6 h-6 animate-spin text-fuchsia-400 mx-auto" />
+              <p className="text-zinc-200 font-medium">Finding the best part of your song…</p>
+              <p className="text-xs text-zinc-500 truncate">{file.name}</p>
+            </div>
+          ) : autoStep === 'choose' ? (
+            <div className="space-y-4">
+              <div className="flex items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-900/40 px-4 py-3">
+                <p className="min-w-0 flex-1 text-sm text-zinc-200 truncate" title={file.name}>{file.name}</p>
+                <label className="text-xs text-fuchsia-400 hover:text-fuchsia-300 cursor-pointer shrink-0">
+                  Replace
+                  <input type="file" accept="audio/*" className="hidden" onChange={(e) => pickFile(e.target.files[0])} />
+                </label>
+              </div>
+
+              <div>
+                <p className="text-sm text-zinc-200 font-medium">Choose the part for your reel</p>
+                <p className="text-xs text-zinc-500 mt-0.5">
+                  {(hooks?.[hookLen]?.length ?? 0) > 0
+                    ? 'The best part is already selected. Tap another one to hear it and use it.'
+                    : 'No hook was found, so the first 30 seconds are used.'}
+                </p>
+              </div>
+
+              {hookState === 'ready' && Object.keys(hooks ?? {}).length > 1 && (
+                <div className="flex gap-1.5">
+                  {Object.keys(hooks).map((key) => (
+                    <button
+                      key={key} onClick={() => chooseHookLength(key)}
+                      className={`px-3 py-1 rounded-md text-xs border transition-colors ${
+                        hookLen === key ? 'border-fuchsia-500 bg-fuchsia-500/10 text-fuchsia-300' : 'border-zinc-800 text-zinc-400 hover:border-zinc-700'
+                      }`}
+                    >
+                      {key} sec
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              <div className="space-y-1.5">
+                {(hooks?.[hookLen] ?? []).slice(0, 4).map((h, i) => {
+                  const selected = Math.abs(region.start - h.start) < 0.05 && Math.abs(region.end - h.end) < 0.05;
+                  return (
+                    <button
+                      key={i} onClick={() => chooseHook(h)}
+                      className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg border text-left transition-colors ${
+                        selected ? 'border-fuchsia-500 bg-fuchsia-500/10' : 'border-zinc-800 hover:border-zinc-700'
+                      }`}
+                    >
+                      <Play className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                      <span className="text-sm text-zinc-200">Hook {i + 1}</span>
+                      {i === 0 && <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300">Best</span>}
+                      <span className="ml-auto font-mono text-xs text-zinc-400">{formatTime(h.start)} – {formatTime(h.end)}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <button
+                onClick={() => setAutoStep('go')}
+                className="w-full py-3 rounded-xl text-sm font-medium bg-fuchsia-600 hover:bg-fuchsia-500 transition-colors flex items-center justify-center gap-2"
+              >
+                <Sparkles className="w-4 h-4" /> Create reel <span className="font-mono text-fuchsia-200">({formatTime(regionLength)})</span>
+              </button>
+            </div>
+          ) : working ? (
+            <div className="space-y-3 mx-auto w-fit">
+              {[
+                { label: 'Writing the lyrics', done: autoStep === 'image', active: autoStep !== 'image' },
+                { label: 'Drawing the picture', done: false, active: autoStep === 'image' },
+              ].map((s) => (
+                <div key={s.label} className={`flex items-center gap-3 text-sm ${s.done ? 'text-emerald-400' : s.active ? 'text-zinc-100' : 'text-zinc-600'}`}>
+                  {s.done ? <Check className="w-4 h-4" /> : s.active ? <Loader2 className="w-4 h-4 animate-spin text-fuchsia-400" /> : <span className="w-4 h-4 rounded-full border border-zinc-700" />}
+                  {s.label}
+                </div>
+              ))}
+              {statusMsg && autoStep !== 'image' && <p className="text-xs text-zinc-500 pl-7">{statusMsg}</p>}
+            </div>
+          ) : phase === 'error' ? (
+            <div className="text-center space-y-3">
+              <p className="text-sm text-rose-300 break-words">Something went wrong: {error}</p>
+              <button onClick={() => setAutoStep('go')} className="px-4 py-2 rounded-md text-sm border border-zinc-700 hover:bg-zinc-800 transition-colors inline-flex items-center gap-2">
+                <RotateCcw className="w-4 h-4" /> Try again
+              </button>
+            </div>
+          ) : (
+            <div className="text-center space-y-3">
+              <p className="text-sm text-zinc-400">No lyrics were detected in this part. Try another part of the song.</p>
+              <button onClick={backToFullSong} className="px-4 py-2 rounded-md text-sm border border-zinc-700 hover:bg-zinc-800 transition-colors">
+                Choose another part
+              </button>
+            </div>
+          )}
+        </div>
+      </main>
+    </div>
+  );
+
   return (
-    <div className="h-screen w-screen min-w-[1100px] bg-[#0b0b0d] text-zinc-100 font-sans flex flex-col overflow-hidden">
+    <div className="h-[100dvh] w-full bg-[#0b0b0d] text-zinc-100 font-sans flex flex-col overflow-hidden">
+      {wizardView}
       {/* Top bar */}
       <header className="h-12 shrink-0 border-b border-zinc-800 bg-[#111113] flex items-center gap-3 px-3">
         <button onClick={onBack} className="p-1.5 rounded-md text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors" title="Back">
           <ArrowLeft className="w-4 h-4" />
         </button>
         <div className="flex items-center gap-2">
-          <Languages className="w-4 h-4 text-indigo-400" />
-          <span className="text-sm font-semibold">Lyrics Studio</span>
+          {auto ? <Sparkles className="w-4 h-4 text-fuchsia-400" /> : <Languages className="w-4 h-4 text-indigo-400" />}
+          <span className="text-sm font-semibold">{auto ? 'Hook to Reel' : 'Lyrics Studio'}</span>
         </div>
         <span className="text-zinc-700">/</span>
         <span className="text-sm text-zinc-400 truncate max-w-md">{file ? file.name : 'No song loaded'}</span>
@@ -978,15 +1231,8 @@ export default function LyricsEditor({ onBack }) {
           {separating && (
             <span className="text-xs text-indigo-300 flex items-center gap-2"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Removing voice…</span>
           )}
-          {phase === 'done' && <span className="text-xs text-emerald-400">Transcript ready</span>}
-          <button
-            onClick={handleGenerate}
-            disabled={!file || phase === 'generating'}
-            className="px-4 py-1.5 rounded-md text-sm font-medium bg-indigo-600 hover:bg-indigo-500 disabled:bg-zinc-800 disabled:text-zinc-500 transition-colors flex items-center gap-2"
-          >
-            <Sparkles className="w-4 h-4" />
-            {phase === 'done' ? 'Regenerate' : 'Generate lyrics'}
-          </button>
+          {auto && autoStep === 'done' && <span className="text-xs text-emerald-400">Reel ready. Press Download MP4.</span>}
+          {phase === 'done' && !(auto && autoStep) && <span className="text-xs text-emerald-400">Transcript ready</span>}
           {exportState ? (
             <div className="flex items-center gap-2 text-xs text-indigo-300">
               <div className="w-28 h-1.5 rounded-full bg-zinc-800 overflow-hidden">
@@ -1056,9 +1302,9 @@ export default function LyricsEditor({ onBack }) {
         </div>
       </div>
 
-      <div className="flex flex-1 min-h-0">
+      <div className="flex flex-col lg:flex-row flex-1 min-h-0 overflow-y-auto lg:overflow-y-hidden">
         {/* Left: the picture, as a conversation */}
-        <aside className="w-80 shrink-0 border-r border-zinc-800 bg-[#0f0f11] flex flex-col min-h-0">
+        <aside style={{ width: panelW.left }} className="shrink-0 border-b lg:border-b-0 lg:border-r border-zinc-800 bg-[#0f0f11] flex flex-col min-h-[400px] lg:min-h-0 !w-full lg:!w-auto">
           <div className="shrink-0 px-4 py-3 border-b border-zinc-800 flex items-center gap-2">
             <ImageIcon className="w-4 h-4 text-indigo-400" />
             <span className="text-sm font-semibold">Picture</span>
@@ -1159,6 +1405,7 @@ export default function LyricsEditor({ onBack }) {
             </div>
           </div>
         </aside>
+        <div className="hidden lg:block"><PanelResizer onStart={startResize('left')} onMove={moveResize} onEnd={endResize} onReset={resetPanel('left')} /></div>
 
         {/* Center: preview + timeline */}
         <main className="flex-1 min-w-0 flex flex-col">
@@ -1209,15 +1456,51 @@ export default function LyricsEditor({ onBack }) {
                 </button>
               </div>
             ) : lines.length > 0 && centerTab === 'clip' ? (
-              <div className="w-full h-full p-4 flex flex-col items-center gap-2">
+              <div
+                ref={clipBoxRef}
+                className={`w-full h-full flex flex-col items-center gap-2 ${isFullscreen ? 'bg-black p-0 gap-0' : 'p-4'}`}
+              >
                 <canvas
                   ref={previewCanvasRef}
                   width={SIZES[clip.aspect][0] / 2} height={SIZES[clip.aspect][1] / 2}
-                  className="flex-1 min-h-0 w-full rounded-lg bg-black cursor-move touch-none"
+                  className={`flex-1 min-h-0 w-full bg-black touch-none ${isFullscreen ? '' : 'rounded-lg cursor-move'}`}
                   style={{ objectFit: 'contain' }}
-                  onPointerDown={startTextDrag} onPointerMove={moveText} onPointerUp={endTextDrag} onDoubleClick={resetTextPosition}
+                  onPointerDown={isFullscreen ? undefined : startTextDrag}
+                  onPointerMove={isFullscreen ? undefined : moveText}
+                  onPointerUp={isFullscreen ? undefined : endTextDrag}
+                  onDoubleClick={isFullscreen ? undefined : resetTextPosition}
                 />
-                <p className="text-[11px] text-zinc-500">Drag the text to place it (double-click puts it back). Press play (or Space) to watch it with the song. The video you download looks exactly like this.</p>
+                {isFullscreen ? (
+                  <div className="w-full shrink-0 h-12 bg-black/80 flex items-center gap-4 px-4">
+                    <button
+                      onClick={togglePlay}
+                      className="w-8 h-8 rounded-full bg-indigo-600 hover:bg-indigo-500 flex items-center justify-center transition-colors"
+                      title="Play / pause (Space)"
+                    >
+                      {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 ml-0.5" />}
+                    </button>
+                    <span className="font-mono text-xs text-zinc-300">{formatTime(currentTime)}</span>
+                    <span className="font-mono text-xs text-zinc-600">/ {formatTime(duration)}</span>
+                    <button
+                      onClick={toggleFullscreen}
+                      className="ml-auto px-3 py-1.5 rounded-md text-xs text-zinc-200 hover:bg-zinc-800 flex items-center gap-1.5 transition-colors"
+                      title="Leave full screen (Esc)"
+                    >
+                      <Minimize className="w-3.5 h-3.5" /> Exit full screen
+                    </button>
+                  </div>
+                ) : (
+                  <div className="w-full flex items-center gap-3">
+                    <p className="flex-1 text-[11px] text-zinc-500">Drag the text to place it (double-click puts it back). Press play (or Space) to watch it with the song. The video you download looks exactly like this.</p>
+                    <button
+                      onClick={toggleFullscreen}
+                      className="shrink-0 px-3 py-1.5 rounded-md text-xs border border-zinc-700 text-zinc-200 hover:bg-zinc-800 flex items-center gap-1.5 transition-colors"
+                      title="Watch the clip full screen"
+                    >
+                      <Maximize className="w-3.5 h-3.5" /> Full screen
+                    </button>
+                  </div>
+                )}
               </div>
             ) : lines.length > 0 ? (
               <div ref={previewRef} className="relative w-full h-full overflow-y-auto text-center">
@@ -1363,16 +1646,24 @@ export default function LyricsEditor({ onBack }) {
         </main>
 
         {/* Right: transcript */}
-        <aside className="w-96 shrink-0 border-l border-zinc-800 bg-[#0f0f11] flex flex-col min-h-0">
-          {/* Song, trim and voice, above the transcript */}
-          <div className="shrink-0 p-4 border-b border-zinc-800 space-y-3">
-            <div className="flex items-center gap-2 min-w-0">
-              <Upload className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-              {file ? (
+        <div className="hidden lg:block"><PanelResizer onStart={startResize('right')} onMove={moveResize} onEnd={endResize} onReset={resetPanel('right')} /></div>
+        <aside style={{ width: panelW.right }} className="shrink-0 border-t lg:border-t-0 lg:border-l border-zinc-800 bg-[#0f0f11] flex flex-col min-h-[400px] lg:min-h-0 !w-full lg:!w-auto">
+          {!file ? (
+            <div className="flex-1 flex items-center justify-center p-8">
+              <p className="text-sm text-zinc-600 text-center">Choose a song to begin. Then pick the part you want and generate the lyrics.</p>
+            </div>
+          ) : (
+            <>
+              {/* Song, trim and voice, above the transcript */}
+              <div className="shrink-0 p-4 border-b border-zinc-800 space-y-4">
                 <div className="min-w-0">
-                  <p className="text-xs text-zinc-200 truncate" title={file.name}>{file.name}</p>
-                  <p className="text-[11px] text-zinc-500 flex items-center gap-2">
+                  <p className="text-sm text-zinc-200 truncate" title={file.name}>{file.name}</p>
+                  <p className="mt-0.5 text-[11px] text-zinc-500 flex items-center gap-2 flex-wrap">
                     <span>{(file.size / 1024 / 1024).toFixed(1)} MB{duration ? ` · ${formatTime(duration)}` : ''}</span>
+                    <label className="text-indigo-400 hover:text-indigo-300 cursor-pointer">
+                      Replace
+                      <input type="file" accept="audio/*" className="hidden" onChange={(e) => pickFile(e.target.files[0])} />
+                    </label>
                     {originalFile && file !== originalFile && (
                       <button
                         onClick={backToFullSong}
@@ -1382,116 +1673,114 @@ export default function LyricsEditor({ onBack }) {
                         Choose another part
                       </button>
                     )}
-                    <label className="text-indigo-400 hover:text-indigo-300 cursor-pointer">
-                      Replace
-                      <input type="file" accept="audio/*" className="hidden" onChange={(e) => pickFile(e.target.files[0])} />
-                    </label>
                   </p>
                 </div>
-              ) : (
-                <label className="flex-1 text-center text-xs text-zinc-400 border border-dashed border-zinc-700 hover:border-indigo-500/60 rounded-md py-1.5 cursor-pointer transition-colors">
-                  Choose a song
-                  <input type="file" accept="audio/*" className="hidden" onChange={(e) => pickFile(e.target.files[0])} />
-                </label>
-              )}
-            </div>
 
-            <div className="flex items-center gap-2 flex-wrap">
-              <Scissors className="w-3.5 h-3.5 text-zinc-500" />
-              <TimeField label="Start" value={region.start} disabled={trimLocked} onCommit={(v) => applyRegion(v, region.end)} />
-              <TimeField label="End" value={region.end} disabled={trimLocked} onCommit={(v) => applyRegion(region.start, v)} />
-              <span
-                className="text-xs text-zinc-500"
-                title={`Drag the edges on the timeline. Up to ${ISOLATE_MAX_SEC}s the vocals are separated first, which gives better lyrics but takes about a minute.`}
-              >
-                Selected <span className="text-zinc-300 font-mono">{formatTime(regionLength)}</span>
-              </span>
-            </div>
-
-            <label
-              className="flex items-center gap-2 cursor-pointer text-xs text-zinc-300"
-              title="The lyrics stay on screen, but only the music plays. The voice is taken out after the lyrics are ready, and that takes about as long as the part itself."
-            >
-              <MicOff className="w-3.5 h-3.5 text-zinc-500" />
-              <input
-                type="checkbox" checked={removeVoice} disabled={phase === 'generating' || separating}
-                onChange={(e) => changeRemoveVoice(e.target.checked)}
-                className="accent-indigo-500"
-              />
-              Remove voice (karaoke)
-              {separating && <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-300" />}
-            </label>
-          </div>
-
-          <div className="shrink-0 p-4 border-b border-zinc-800">
-            <div className="flex items-center justify-between">
-              <PanelTitle>Transcript · Hinglish</PanelTitle>
-              <span className="text-xs text-zinc-600 -mt-3">{lines.length} lines</span>
-            </div>
-            <div className="mt-2 grid grid-cols-2 gap-2">
-              <button
-                onClick={addLine} disabled={!file || phase === 'generating'}
-                className="py-1.5 rounded-md text-xs border border-dashed border-zinc-700 text-zinc-300 hover:border-indigo-500/60 hover:text-white disabled:opacity-40 disabled:hover:border-zinc-700 transition-colors flex items-center justify-center gap-1.5"
-                title="Add an empty line at the playhead (or after the line the playhead is in)"
-              >
-                <Plus className="w-3.5 h-3.5" /> Add line <span className="font-mono">{formatTime(currentTime)}</span>
-              </button>
-              <button
-                onClick={splitAtPlayhead} disabled={splitIdx < 0 || phase === 'generating'}
-                className="py-1.5 rounded-md text-xs border border-dashed border-zinc-700 text-zinc-300 hover:border-indigo-500/60 hover:text-white disabled:opacity-40 disabled:hover:border-zinc-700 transition-colors flex items-center justify-center gap-1.5"
-                title="Cut the line under the playhead into two"
-              >
-                <Scissors className="w-3.5 h-3.5" /> Split at playhead
-              </button>
-            </div>
-          </div>
-
-          <div className="flex-1 min-h-0 overflow-y-auto p-2">
-            {lines.length === 0 ? (
-              <p className="text-sm text-zinc-600 p-4">
-                {phase === 'generating' ? 'Working on it…' : 'The lyrics will appear here. You can fix any word by clicking on it, or add your own lines with the button above.'}
-              </p>
-            ) : (
-              lines.map((l, i) => (
-                <div
-                  key={i}
-                  ref={(el) => { rowRefs.current[i] = el; }}
-                  className={`group rounded-lg px-2 py-1.5 transition-colors ${i === activeIdx ? 'bg-amber-400/10' : 'hover:bg-zinc-900/60'}`}
-                >
-                  <div className="flex items-start gap-2">
-                    <button
-                      onClick={() => seekTo(l.start)}
-                      className={`shrink-0 mt-1.5 font-mono text-[11px] hover:text-white ${i === activeIdx ? 'text-amber-300' : 'text-zinc-500'}`}
-                      title="Play from here"
+                <div>
+                  <PanelTitle>Part to use</PanelTitle>
+                  <div className="grid grid-cols-3 gap-2">
+                    <TimeField label="Start" value={region.start} disabled={trimLocked} onCommit={(v) => applyRegion(v, region.end)} />
+                    <TimeField label="End" value={region.end} disabled={trimLocked} onCommit={(v) => applyRegion(region.start, v)} />
+                    <div
+                      className="min-w-0"
+                      title={`Drag the edges on the timeline. Up to ${ISOLATE_MAX_SEC}s the vocals are separated first, which gives better lyrics but takes about a minute.`}
                     >
-                      {formatTime(l.start)}
-                    </button>
-                    <textarea
-                      ref={(el) => { textRefs.current[i] = el; }}
-                      rows={2}
-                      maxLength={200}
-                      value={l.text}
-                      onChange={(e) => updateLineText(i, e.target.value)}
-                      className={`flex-1 min-w-0 resize-none bg-transparent text-sm leading-snug rounded px-1.5 py-1 focus:outline-none focus:bg-zinc-900 ${i === activeIdx ? 'text-amber-200' : 'text-zinc-200'}`}
-                    />
-                    <button
-                      onClick={() => removeLine(i)}
-                      className="shrink-0 mt-1 p-1 rounded text-zinc-600 opacity-0 group-hover:opacity-100 hover:text-rose-400 transition"
-                      title="Delete this line"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                  <div className="mt-0.5 pl-[3.4rem] flex gap-3 text-[10px] text-zinc-500 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
-                    <button onClick={() => insertNextTo(i, -1)} className="hover:text-indigo-300" title="Add an empty line before this one">+ above</button>
-                    <button onClick={() => insertNextTo(i, 1)} className="hover:text-indigo-300" title="Add an empty line after this one">+ below</button>
-                    <button onClick={() => setEdge(i, 'start')} className="hover:text-indigo-300" title="Make this line start at the playhead">start = now</button>
-                    <button onClick={() => setEdge(i, 'end')} className="hover:text-indigo-300" title="Make this line end at the playhead">end = now</button>
+                      <span className="block text-[10px] text-zinc-500 mb-1">Length</span>
+                      <p className="border border-transparent px-2 py-1.5 text-xs font-mono text-zinc-300">{formatTime(regionLength)}</p>
+                    </div>
                   </div>
                 </div>
-              ))
-            )}
-          </div>
+
+                <label
+                  className="flex items-center gap-2 cursor-pointer text-xs text-zinc-300"
+                  title="The lyrics stay on screen, but only the music plays. The voice is taken out after the lyrics are ready, and that takes about as long as the part itself."
+                >
+                  <input
+                    type="checkbox" checked={removeVoice} disabled={phase === 'generating' || separating}
+                    onChange={(e) => changeRemoveVoice(e.target.checked)}
+                    className="accent-indigo-500"
+                  />
+                  Remove voice (karaoke)
+                  {separating && <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-300" />}
+                </label>
+
+                <button
+                  onClick={handleGenerate}
+                  disabled={phase === 'generating'}
+                  className="w-full py-2 rounded-md text-sm font-medium bg-indigo-600 hover:bg-indigo-500 disabled:bg-zinc-800 disabled:text-zinc-500 transition-colors flex items-center justify-center gap-2"
+                >
+                  {phase === 'generating' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                  {phase === 'generating' ? 'Working…' : phase === 'done' ? 'Regenerate lyrics' : 'Generate lyrics'}
+                </button>
+              </div>
+
+              <div className="shrink-0 px-4 py-3 border-b border-zinc-800 flex items-center gap-2">
+                <h2 className="text-[11px] font-semibold text-zinc-500 uppercase tracking-wider">Lyrics</h2>
+                <span className="text-xs text-zinc-600">{lines.length}</span>
+                <div className="ml-auto flex items-center gap-1">
+                  <button
+                    onClick={addLine} disabled={phase === 'generating'}
+                    className="px-2 py-1 rounded-md text-xs text-zinc-300 hover:bg-zinc-800 hover:text-white disabled:opacity-40 disabled:hover:bg-transparent transition-colors flex items-center gap-1"
+                    title="Add an empty line at the playhead (or after the line the playhead is in)"
+                  >
+                    <Plus className="w-3.5 h-3.5" /> Add
+                  </button>
+                  <button
+                    onClick={splitAtPlayhead} disabled={splitIdx < 0 || phase === 'generating'}
+                    className="px-2 py-1 rounded-md text-xs text-zinc-300 hover:bg-zinc-800 hover:text-white disabled:opacity-40 disabled:hover:bg-transparent transition-colors flex items-center gap-1"
+                    title="Cut the line under the playhead into two"
+                  >
+                    <Scissors className="w-3.5 h-3.5" /> Split
+                  </button>
+                </div>
+              </div>
+
+              <div className="flex-1 min-h-0 overflow-y-auto p-2">
+                {lines.length === 0 ? (
+                  <p className="text-sm text-zinc-600 p-4">
+                    {phase === 'generating' ? 'Working on it…' : 'Press “Generate lyrics”. You can then fix any word by clicking on it.'}
+                  </p>
+                ) : (
+                  lines.map((l, i) => (
+                    <div
+                      key={i}
+                      ref={(el) => { rowRefs.current[i] = el; }}
+                      className={`group rounded-lg px-2 py-1.5 transition-colors ${i === activeIdx ? 'bg-amber-400/10' : 'hover:bg-zinc-900/60'}`}
+                    >
+                      <div className="flex items-start gap-2">
+                        <button
+                          onClick={() => seekTo(l.start)}
+                          className={`shrink-0 mt-1.5 font-mono text-[11px] hover:text-white ${i === activeIdx ? 'text-amber-300' : 'text-zinc-500'}`}
+                          title="Play from here"
+                        >
+                          {formatTime(l.start)}
+                        </button>
+                        <textarea
+                          ref={(el) => { textRefs.current[i] = el; }}
+                          rows={2}
+                          maxLength={200}
+                          value={l.text}
+                          onChange={(e) => updateLineText(i, e.target.value)}
+                          className={`flex-1 min-w-0 resize-none bg-transparent text-sm leading-snug rounded px-1.5 py-1 focus:outline-none focus:bg-zinc-900 ${i === activeIdx ? 'text-amber-200' : 'text-zinc-200'}`}
+                        />
+                        <button
+                          onClick={() => removeLine(i)}
+                          className="shrink-0 mt-1 p-1 rounded text-zinc-600 opacity-0 group-hover:opacity-100 hover:text-rose-400 transition"
+                          title="Delete this line"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                      <div className="mt-0.5 pl-[3.4rem] flex gap-3 text-[10px] text-zinc-500 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                        <button onClick={() => setEdge(i, 'start')} className="hover:text-indigo-300" title="Make this line start at the playhead">start = now</button>
+                        <button onClick={() => setEdge(i, 'end')} className="hover:text-indigo-300" title="Make this line end at the playhead">end = now</button>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            </>
+          )}
         </aside>
       </div>
     </div>

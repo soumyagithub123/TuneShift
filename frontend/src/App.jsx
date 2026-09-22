@@ -1,10 +1,13 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import WaveSurfer from 'wavesurfer.js';
 import RegionsPlugin from 'wavesurfer.js/dist/plugins/regions.esm.js';
-import { Upload, Music, Download, Loader2, SlidersHorizontal, Play, Pause, MicOff, Wand2, ArrowLeft, Clock, PlayCircle, Film, Image as ImageIcon, Plus, X, Languages } from 'lucide-react';
+import { Upload, Music, Download, Loader2, SlidersHorizontal, Play, Pause, Mic, MicOff, Wand2, ArrowLeft, Clock, PlayCircle, Film, Image as ImageIcon, Plus, X, Languages, Headphones, AudioLines, Sparkles, Drama, Pencil, Trash2, Check } from 'lucide-react';
 import LyricsEditor from './LyricsEditor';
+import RemixStudio from './RemixStudio';
+import AudioExtractor from './AudioExtractor';
+import VoiceChanger from './VoiceChanger';
 
-const API = 'http://localhost:8000';
+const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 const LANGUAGES = [
   { id: 'hi', name: 'Hindi' },
@@ -70,12 +73,25 @@ export default function App() {
   // History State
   const [history, setHistory] = useState([]);
   const [activeHistoryItem, setActiveHistoryItem] = useState(null);
+  const [editingHistoryId, setEditingHistoryId] = useState(null);
+  const [editingValue, setEditingValue] = useState('');
+  const [deletingHistoryId, setDeletingHistoryId] = useState(null);
 
   const [isGenerating, setIsGenerating] = useState(false);
   const [jobStatus, setJobStatus] = useState(null);
   const [jobId, setJobId] = useState(null);
   const [resultUrl, setResultUrl] = useState(null);
-  
+
+  // Live tweaks on a finished compose job: the extracted melody stays on the server, so
+  // changing instrument/transpose/accompaniment afterwards only re-renders, not the whole pipeline.
+  const [instrumentsList, setInstrumentsList] = useState(INSTRUMENTS); // replaced by /instruments once loaded
+  const [project, setProject] = useState(null);
+  const [editing, setEditing] = useState(false);
+  const [editError, setEditError] = useState('');
+  const [aiInstruction, setAiInstruction] = useState('');
+  const [aiReply, setAiReply] = useState('');
+  const editDebounce = useRef(null);
+
   // Natural Progress State
   const [displayProgress, setDisplayProgress] = useState(0);
 
@@ -86,10 +102,20 @@ export default function App() {
   const regions = useRef(null);
   const [region, setRegion] = useState({ start: 0, end: 0 });
 
+  // Live pitch/tempo tweak on a finished Remove Voice / Extract Vocals job: the separated part
+  // stays on the server, so this just re-renders the effect instead of redoing separation.
+  const [karaokePitch, setKaraokePitch] = useState(0);
+  const [karaokeTempo, setKaraokeTempo] = useState(1.0);
+  const [karaokeBlobUrl, setKaraokeBlobUrl] = useState(null);
+  const [karaokeTweaking, setKaraokeTweaking] = useState(false);
+  const [karaokeTweakError, setKaraokeTweakError] = useState('');
+  const karaokeTweakSeq = useRef(0);
+  useEffect(() => () => { if (karaokeBlobUrl) URL.revokeObjectURL(karaokeBlobUrl); }, [karaokeBlobUrl]);
+
   // Fetch history from backend
   const fetchHistory = async () => {
     try {
-      const res = await fetch('http://localhost:8000/history');
+      const res = await fetch(`${API}/history`);
       if (res.ok) {
         const data = await res.json();
         setHistory(data);
@@ -102,6 +128,156 @@ export default function App() {
   useEffect(() => {
     fetchHistory();
   }, [mode]);
+
+  const startRenameHistoryItem = (item) => {
+    setEditingHistoryId(item.job_id);
+    setEditingValue(item.filename);
+  };
+
+  const cancelRenameHistoryItem = () => {
+    setEditingHistoryId(null);
+    setEditingValue('');
+  };
+
+  const saveRenameHistoryItem = async (jobId) => {
+    const filename = editingValue.trim();
+    if (!filename) return;
+    try {
+      const res = await fetch(`${API}/history/${jobId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename }),
+      });
+      if (!res.ok) throw new Error('Could not rename this item');
+      setHistory((items) => items.map((it) => (it.job_id === jobId ? { ...it, filename } : it)));
+      setEditingHistoryId(null);
+      setEditingValue('');
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+
+  const deleteHistoryItem = async (item) => {
+    if (!window.confirm(`Delete "${item.filename}" from history? This cannot be undone.`)) return;
+    setDeletingHistoryId(item.job_id);
+    try {
+      const res = await fetch(`${API}/history/${item.job_id}`, { method: 'DELETE' });
+      if (!res.ok) throw new Error('Could not delete this item');
+      setHistory((items) => items.filter((it) => it.job_id !== item.job_id));
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setDeletingHistoryId(null);
+    }
+  };
+
+  // The full instrument list (18) lives on the backend; the constant above is just a fallback.
+  useEffect(() => {
+    fetch(`${API}/instruments`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => { if (data) setInstrumentsList(data); })
+      .catch((err) => console.error("Failed to fetch instruments:", err));
+  }, []);
+
+  const fetchProject = async (id) => {
+    try {
+      const res = await fetch(`${API}/projects/${id}`);
+      if (res.ok) setProject(await res.json());
+    } catch (err) {
+      console.error("Failed to fetch project:", err);
+    }
+  };
+
+  // Apply a settings change to a finished job: it re-renders from the cached melody, so it's quick.
+  const applyEdit = async (ops) => {
+    if (!jobId) return;
+    setEditing(true);
+    setEditError('');
+    try {
+      const res = await fetch(`${API}/projects/${jobId}/edit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(ops),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(typeof body.detail === 'string' ? body.detail : 'Could not update the tune');
+      }
+      setProject(await res.json());
+    } catch (err) {
+      setEditError(err.message);
+    } finally {
+      setEditing(false);
+    }
+  };
+
+  // For sliders: wait for the drag to settle before hitting the server.
+  const applyEditDebounced = (ops, delay = 400) => {
+    if (editDebounce.current) clearTimeout(editDebounce.current);
+    editDebounce.current = setTimeout(() => applyEdit(ops), delay);
+  };
+
+  const applyAiEdit = async () => {
+    if (!jobId || !aiInstruction.trim()) return;
+    setEditing(true);
+    setEditError('');
+    setAiReply('');
+    try {
+      const res = await fetch(`${API}/projects/${jobId}/ai-edit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instruction: aiInstruction.trim() }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(typeof body.detail === 'string' ? body.detail : 'Could not apply that');
+      }
+      const data = await res.json();
+      setProject(data.project);
+      setAiReply(data.reply);
+      setAiInstruction('');
+    } catch (err) {
+      setEditError(err.message);
+    } finally {
+      setEditing(false);
+    }
+  };
+
+  // Re-render the separated karaoke part at a new pitch/tempo (mode is 'remove_voice' or 'vocals_only').
+  // `overrides` carries a just-changed value in, since the state setter that triggered this
+  // hasn't landed yet when this runs.
+  const applyKaraokeTweak = async (overrides = {}) => {
+    if (!jobId) return;
+    const seq = ++karaokeTweakSeq.current;
+    setKaraokeTweaking(true);
+    setKaraokeTweakError('');
+    try {
+      const res = await fetch(`${API}/tunes/${jobId}/tweak`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode, pitch: karaokePitch, tempo: karaokeTempo, ...overrides }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(typeof body.detail === 'string' ? body.detail : 'Could not update');
+      }
+      const blob = await res.blob();
+      if (seq !== karaokeTweakSeq.current) return; // a newer tweak is already in flight
+      setKaraokeBlobUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return URL.createObjectURL(blob);
+      });
+    } catch (err) {
+      if (seq === karaokeTweakSeq.current) setKaraokeTweakError(err.message);
+    } finally {
+      if (seq === karaokeTweakSeq.current) setKaraokeTweaking(false);
+    }
+  };
+  const karaokeDebounce = useRef(null);
+  const applyKaraokeTweakDebounced = (overrides, delay = 400) => {
+    if (karaokeDebounce.current) clearTimeout(karaokeDebounce.current);
+    karaokeDebounce.current = setTimeout(() => applyKaraokeTweak(overrides), delay);
+  };
 
   // Natural Progress Animation Effect
   useEffect(() => {
@@ -138,7 +314,7 @@ export default function App() {
 
 
   useEffect(() => {
-    if (file && waveformRef.current && !wavesurfer.current && (mode === 'remove_voice' || mode === 'compose' || mode === 'reel')) {
+    if (file && waveformRef.current && !wavesurfer.current && (mode === 'remove_voice' || mode === 'vocals_only' || mode === 'compose' || mode === 'reel')) {
       wavesurfer.current = WaveSurfer.create({
         container: waveformRef.current,
         waveColor: '#4f46e5',
@@ -233,16 +409,17 @@ export default function App() {
     if (jobId && isGenerating) {
       interval = setInterval(async () => {
         try {
-          const res = await fetch(`http://localhost:8000/status/${jobId}`);
+          const res = await fetch(`${API}/status/${jobId}`);
           if (res.ok) {
             const data = await res.json();
             setJobStatus(data.message);
             if (data.status === 'completed') {
               setIsGenerating(false);
               setJobStatus("Done");
-              const url = `http://localhost:8000/download/${jobId}`;
+              const url = `${API}/download/${jobId}`;
               setResultUrl(url);
               if (mode === 'reel') fetchReelLyrics(jobId);
+              if (mode === 'compose') fetchProject(jobId);
               fetchHistory();
               clearInterval(interval);
             } else if (data.status === 'failed') {
@@ -290,6 +467,10 @@ export default function App() {
     setJobStatus("Uploading...");
     setResultUrl(null);
     setLyricLines([]);
+    setKaraokePitch(0);
+    setKaraokeTempo(1.0);
+    setKaraokeTweakError('');
+    setKaraokeBlobUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return null; });
 
     const formData = new FormData();
     formData.append('file', file);
@@ -310,7 +491,7 @@ export default function App() {
     }
 
     try {
-      const res = await fetch('http://localhost:8000/generate', {
+      const res = await fetch(`${API}/generate`, {
         method: 'POST',
         body: formData,
       });
@@ -329,7 +510,7 @@ export default function App() {
 
   const openHistoryItem = (item) => {
     setActiveHistoryItem(item);
-    setResultUrl(`http://localhost:8000/download/${item.job_id}`);
+    setResultUrl(`${API}/download/${item.job_id}`);
     setMode('view_history');
   };
 
@@ -337,69 +518,150 @@ export default function App() {
     return <LyricsEditor onBack={() => setMode(null)} />;
   }
 
+  if (mode === 'hookreel') {
+    return <LyricsEditor auto onBack={() => setMode(null)} />;
+  }
+
+  if (mode === 'remix') {
+    return <RemixStudio onBack={() => setMode(null)} />;
+  }
+
+  if (mode === 'voice_changer') {
+    return <VoiceChanger onBack={() => setMode(null)} />;
+  }
+
+  if (mode === 'extract') {
+    return <AudioExtractor onBack={() => setMode(null)} />;
+  }
+
   // ----------------------------------------------------
   // RENDER: HOME SCREEN (MODE SELECTION)
   // ----------------------------------------------------
   if (mode === null) {
     return (
-      <div className="min-h-screen bg-[#0f0f11] text-zinc-100 p-4 font-sans flex items-center justify-center flex-col">
-        <div className="w-full max-w-3xl bg-[#161618] border border-zinc-800 rounded-2xl overflow-hidden shadow-2xl p-10 text-center mb-8">
-          <div className="bg-indigo-500/20 p-4 rounded-2xl inline-block mb-4">
-            <Music className="w-10 h-10 text-indigo-400" />
+      <div className="min-h-[100dvh] bg-[#0f0f11] text-zinc-100 p-4 sm:p-8 font-sans flex items-start sm:items-center justify-center flex-col">
+        <div className="w-full max-w-3xl bg-[#161618] border border-zinc-800 rounded-2xl overflow-hidden shadow-2xl p-4 sm:p-6 text-center mb-4 mt-4">
+          <div className="bg-indigo-500/20 p-3 rounded-2xl inline-block mb-3">
+            <Music className="w-8 h-8 text-indigo-400" />
           </div>
-          <h1 className="text-3xl font-bold mb-2">Welcome to TuneShift</h1>
-          <p className="text-zinc-400 mb-10">What would you like to do today?</p>
+          <h1 className="text-2xl font-bold mb-1">Welcome to TuneShift</h1>
+          <p className="text-zinc-400 mb-6 text-sm">What would you like to do today?</p>
           
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             <button
-              onClick={() => setMode('lyrics')}
-              className="bg-zinc-900/50 hover:bg-zinc-800/80 border border-zinc-800 hover:border-amber-500/50 p-8 rounded-2xl transition-all flex flex-col items-center gap-4 group"
+              onClick={() => setMode('hookreel')}
+              className="bg-gradient-to-r from-fuchsia-500/10 to-indigo-500/10 hover:from-fuchsia-500/20 hover:to-indigo-500/20 border border-fuchsia-500/30 hover:border-fuchsia-500/60 p-4 rounded-xl transition-all flex items-center justify-center gap-4 group md:col-span-2 lg:col-span-3 text-left"
             >
-              <div className="bg-amber-500/10 p-4 rounded-full group-hover:bg-amber-500/20 transition-colors">
-                <Languages className="w-8 h-8 text-amber-400" />
+              <div className="bg-fuchsia-500/10 p-3 rounded-full group-hover:bg-fuchsia-500/20 transition-colors shrink-0">
+                <Sparkles className="w-6 h-6 text-fuchsia-400" />
               </div>
               <div>
-                <h2 className="text-xl font-semibold mb-2 text-zinc-200">Song to Lyrics</h2>
-                <p className="text-sm text-zinc-500">Get the lyrics of any song as Hinglish text, synced with the music.</p>
+                <h2 className="text-lg font-semibold mb-1 text-zinc-200">Hook to Reel</h2>
+                <p className="text-xs text-zinc-400">Choose a song, then pick its best part (or let the app pick it). The lyrics and a picture are made for you, ready to download as a Reel.</p>
+              </div>
+            </button>
+
+            <button
+              onClick={() => setMode('lyrics')}
+              className="bg-zinc-900/50 hover:bg-zinc-800/80 border border-zinc-800 hover:border-amber-500/50 p-4 rounded-xl transition-all flex flex-col items-center gap-3 group"
+            >
+              <div className="bg-amber-500/10 p-3 rounded-full group-hover:bg-amber-500/20 transition-colors">
+                <Languages className="w-6 h-6 text-amber-400" />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold mb-1 text-zinc-200">Song to Lyrics</h2>
+                <p className="text-xs text-zinc-500">Get the lyrics of any song as Hinglish text, synced with the music.</p>
+              </div>
+            </button>
+
+            <button
+              onClick={() => setMode('remix')}
+              className="bg-zinc-900/50 hover:bg-zinc-800/80 border border-zinc-800 hover:border-emerald-500/50 p-4 rounded-xl transition-all flex flex-col items-center gap-3 group"
+            >
+              <div className="bg-emerald-500/10 p-3 rounded-full group-hover:bg-emerald-500/20 transition-colors">
+                <Headphones className="w-6 h-6 text-emerald-400" />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold mb-1 text-zinc-200">Music Remix</h2>
+                <p className="text-xs text-zinc-500">Play the music of a song on another instrument, or turn it into a lofi version.</p>
+              </div>
+            </button>
+
+            <button
+              onClick={() => setMode('voice_changer')}
+              className="bg-zinc-900/50 hover:bg-zinc-800/80 border border-zinc-800 hover:border-violet-500/50 p-4 rounded-xl transition-all flex flex-col items-center gap-3 group"
+            >
+              <div className="bg-violet-500/10 p-3 rounded-full group-hover:bg-violet-500/20 transition-colors">
+                <Drama className="w-6 h-6 text-violet-400" />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold mb-1 text-zinc-200">Voice Changer</h2>
+                <p className="text-xs text-zinc-500">Upload any song and turn the singer's voice into a character — chipmunk, robot, giant and more.</p>
               </div>
             </button>
 
             <button
               onClick={() => { setFile(null); setResultUrl(null); setMode('remove_voice'); }}
-              className="bg-zinc-900/50 hover:bg-zinc-800/80 border border-zinc-800 hover:border-indigo-500/50 p-8 rounded-2xl transition-all flex flex-col items-center gap-4 group"
+              className="bg-zinc-900/50 hover:bg-zinc-800/80 border border-zinc-800 hover:border-indigo-500/50 p-4 rounded-xl transition-all flex flex-col items-center gap-3 group"
             >
-              <div className="bg-rose-500/10 p-4 rounded-full group-hover:bg-rose-500/20 transition-colors">
-                <MicOff className="w-8 h-8 text-rose-400" />
+              <div className="bg-rose-500/10 p-3 rounded-full group-hover:bg-rose-500/20 transition-colors">
+                <MicOff className="w-6 h-6 text-rose-400" />
               </div>
               <div>
-                <h2 className="text-xl font-semibold mb-2 text-zinc-200">Remove Voice</h2>
-                <p className="text-sm text-zinc-500">Strip the vocals from any song to create a clean instrumental karaoke track.</p>
+                <h2 className="text-lg font-semibold mb-1 text-zinc-200">Remove Voice</h2>
+                <p className="text-xs text-zinc-500">Strip the vocals from any song to create a clean instrumental karaoke track.</p>
               </div>
             </button>
-            
-            <button 
-              onClick={() => { setFile(null); setResultUrl(null); setMode('compose'); }}
-              className="bg-zinc-900/50 hover:bg-zinc-800/80 border border-zinc-800 hover:border-indigo-500/50 p-8 rounded-2xl transition-all flex flex-col items-center gap-4 group"
+
+            <button
+              onClick={() => { setFile(null); setResultUrl(null); setMode('vocals_only'); }}
+              className="bg-zinc-900/50 hover:bg-zinc-800/80 border border-zinc-800 hover:border-teal-500/50 p-4 rounded-xl transition-all flex flex-col items-center gap-3 group"
             >
-              <div className="bg-indigo-500/10 p-4 rounded-full group-hover:bg-indigo-500/20 transition-colors">
-                <Wand2 className="w-8 h-8 text-indigo-400" />
+              <div className="bg-teal-500/10 p-3 rounded-full group-hover:bg-teal-500/20 transition-colors">
+                <Mic className="w-6 h-6 text-teal-400" />
               </div>
               <div>
-                <h2 className="text-xl font-semibold mb-2 text-zinc-200">Compose New Song</h2>
-                <p className="text-sm text-zinc-500">Extract the melody and completely replace it with a new instrument.</p>
+                <h2 className="text-lg font-semibold mb-1 text-zinc-200">Extract Vocals</h2>
+                <p className="text-xs text-zinc-500">The opposite of Remove Voice: keep only the singer, strip out all the music.</p>
+              </div>
+            </button>
+
+            <button 
+              onClick={() => { setFile(null); setResultUrl(null); setProject(null); setEditError(''); setAiReply(''); setMode('compose'); }}
+              className="bg-zinc-900/50 hover:bg-zinc-800/80 border border-zinc-800 hover:border-indigo-500/50 p-4 rounded-xl transition-all flex flex-col items-center gap-3 group md:col-span-1 lg:col-span-1"
+            >
+              <div className="bg-indigo-500/10 p-3 rounded-full group-hover:bg-indigo-500/20 transition-colors">
+                <Wand2 className="w-6 h-6 text-indigo-400" />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold mb-1 text-zinc-200">Compose New Song</h2>
+                <p className="text-xs text-zinc-500">Extract the melody and completely replace it with a new instrument.</p>
               </div>
             </button>
 
             <button
               onClick={() => { setFile(null); setResultUrl(null); setBgImage(null); setLyricLines([]); setMode('reel'); }}
-              className="bg-zinc-900/50 hover:bg-zinc-800/80 border border-zinc-800 hover:border-fuchsia-500/50 p-8 rounded-2xl transition-all flex flex-col items-center gap-4 group"
+              className="bg-zinc-900/50 hover:bg-zinc-800/80 border border-zinc-800 hover:border-fuchsia-500/50 p-4 rounded-xl transition-all flex flex-col items-center gap-3 group"
             >
-              <div className="bg-fuchsia-500/10 p-4 rounded-full group-hover:bg-fuchsia-500/20 transition-colors">
-                <Film className="w-8 h-8 text-fuchsia-400" />
+              <div className="bg-fuchsia-500/10 p-3 rounded-full group-hover:bg-fuchsia-500/20 transition-colors">
+                <Film className="w-6 h-6 text-fuchsia-400" />
               </div>
               <div>
-                <h2 className="text-xl font-semibold mb-2 text-zinc-200">Reel Video</h2>
-                <p className="text-sm text-zinc-500">Make a karaoke lyric video with your image, ready to post as a Reel.</p>
+                <h2 className="text-lg font-semibold mb-1 text-zinc-200">Reel Video</h2>
+                <p className="text-xs text-zinc-500">Make a karaoke lyric video with your image, ready to post as a Reel.</p>
+              </div>
+            </button>
+
+            <button
+              onClick={() => setMode('extract')}
+              className="bg-zinc-900/50 hover:bg-zinc-800/80 border border-zinc-800 hover:border-sky-500/50 p-4 rounded-xl transition-all flex flex-col items-center gap-3 group"
+            >
+              <div className="bg-sky-500/10 p-3 rounded-full group-hover:bg-sky-500/20 transition-colors">
+                <AudioLines className="w-6 h-6 text-sky-400" />
+              </div>
+              <div>
+                <h2 className="text-lg font-semibold mb-1 text-zinc-200">Video to Audio</h2>
+                <p className="text-xs text-zinc-500">Take the sound out of an MP4 or any video as an MP3, WAV or M4A file.</p>
               </div>
             </button>
           </div>
@@ -408,32 +670,79 @@ export default function App() {
         {/* History Section on Home Screen */}
         {history.length > 0 && (
           <div className="w-full max-w-3xl">
-            <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+            <h3 className="text-base font-semibold mb-3 flex items-center gap-2">
               <Clock className="w-5 h-5 text-zinc-400" />
               Cloud History
             </h3>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {history.map((item, idx) => (
-                <button 
+                <div
                   key={idx}
-                  onClick={() => openHistoryItem(item)}
-                  className="bg-[#161618] border border-zinc-800 hover:border-indigo-500/30 p-4 rounded-xl flex items-center gap-4 transition-all text-left group"
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => { if (editingHistoryId !== item.job_id) openHistoryItem(item); }}
+                  onKeyDown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && editingHistoryId !== item.job_id) openHistoryItem(item); }}
+                  className="bg-[#161618] border border-zinc-800 hover:border-indigo-500/30 p-4 rounded-xl flex items-center gap-4 transition-all text-left group cursor-pointer"
                 >
-                  <div className={`p-3 rounded-lg transition-colors ${
+                  <div className={`p-3 rounded-lg transition-colors shrink-0 ${
                     item.mode === 'remove_voice' ? 'bg-rose-500/10 text-rose-400 group-hover:bg-rose-500/20'
+                    : item.mode === 'vocals_only' ? 'bg-teal-500/10 text-teal-400 group-hover:bg-teal-500/20'
                     : item.mode === 'reel' ? 'bg-fuchsia-500/10 text-fuchsia-400 group-hover:bg-fuchsia-500/20'
                     : 'bg-indigo-500/10 text-indigo-400 group-hover:bg-indigo-500/20'}`}>
                     <PlayCircle className="w-6 h-6" />
                   </div>
                   <div className="flex-1 overflow-hidden">
-                    <p className="font-medium text-zinc-200 truncate">{item.filename}</p>
-                    <div className="flex gap-2 text-xs text-zinc-500 mt-1">
-                      <span className="capitalize">{item.mode.replace('_', ' ')}</span>
-                      <span>•</span>
-                      <span>{new Date(item.created_at).toLocaleDateString()}</span>
-                    </div>
+                    {editingHistoryId === item.job_id ? (
+                      <div className="flex items-center gap-1.5" onClick={(e) => e.stopPropagation()}>
+                        <input
+                          autoFocus
+                          value={editingValue}
+                          maxLength={200}
+                          onChange={(e) => setEditingValue(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') saveRenameHistoryItem(item.job_id);
+                            if (e.key === 'Escape') cancelRenameHistoryItem();
+                          }}
+                          className="flex-1 min-w-0 bg-zinc-900 border border-indigo-500/50 rounded-lg px-2 py-1 text-sm text-zinc-200"
+                        />
+                        <button onClick={() => saveRenameHistoryItem(item.job_id)} className="p-1.5 text-emerald-400 hover:text-emerald-300 transition-colors shrink-0" title="Save">
+                          <Check className="w-4 h-4" />
+                        </button>
+                        <button onClick={cancelRenameHistoryItem} className="p-1.5 text-zinc-500 hover:text-zinc-300 transition-colors shrink-0" title="Cancel">
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <p className="font-medium text-zinc-200 truncate">{item.filename}</p>
+                        <div className="flex gap-2 text-xs text-zinc-500 mt-1">
+                          <span className="capitalize">{item.mode.replace('_', ' ')}</span>
+                          <span>•</span>
+                          <span>{new Date(item.created_at).toLocaleDateString()}</span>
+                        </div>
+                      </>
+                    )}
                   </div>
-                </button>
+                  {editingHistoryId !== item.job_id && (
+                    <div className="flex items-center gap-1 shrink-0 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); startRenameHistoryItem(item); }}
+                        className="p-1.5 text-zinc-500 hover:text-indigo-400 transition-colors"
+                        title="Rename"
+                      >
+                        <Pencil className="w-4 h-4" />
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); deleteHistoryItem(item); }}
+                        disabled={deletingHistoryId === item.job_id}
+                        className="p-1.5 text-zinc-500 hover:text-rose-400 transition-colors disabled:opacity-50"
+                        title="Delete"
+                      >
+                        {deletingHistoryId === item.job_id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                      </button>
+                    </div>
+                  )}
+                </div>
               ))}
             </div>
           </div>
@@ -446,17 +755,20 @@ export default function App() {
   // RENDER: EDITOR / VIEW HISTORY SCREEN
   // ----------------------------------------------------
   return (
-    <div className="min-h-screen bg-[#0f0f11] text-zinc-100 p-4 font-sans flex items-center justify-center">
-      <div className="w-full max-w-5xl bg-[#161618] border border-zinc-800 rounded-2xl overflow-hidden shadow-2xl">
+    <div className="min-h-[100dvh] bg-[#0f0f11] text-zinc-100 p-4 sm:p-8 font-sans flex items-start sm:items-center justify-center">
+      <div className="w-full max-w-5xl bg-[#161618] border border-zinc-800 rounded-2xl overflow-hidden shadow-2xl my-auto">
         
         {/* Header */}
         <div className="p-6 border-b border-zinc-800 flex items-center gap-4">
-          <button 
+          <button
             onClick={() => {
               setMode(null);
               setFile(null);
               setResultUrl(null);
               setActiveHistoryItem(null);
+              setProject(null);
+              setEditError('');
+              setAiReply('');
               if(wavesurfer.current) wavesurfer.current.destroy();
             }}
             className="p-2 bg-zinc-900 hover:bg-zinc-800 rounded-lg transition-colors text-zinc-400 hover:text-white"
@@ -467,6 +779,7 @@ export default function App() {
           <div className="bg-indigo-500/20 p-2 rounded-lg">
             {mode === 'view_history' ? <Clock className="w-6 h-6 text-indigo-400" /> :
              mode === 'remove_voice' ? <MicOff className="w-6 h-6 text-indigo-400" /> :
+             mode === 'vocals_only' ? <Mic className="w-6 h-6 text-indigo-400" /> :
              mode === 'reel' ? <Film className="w-6 h-6 text-indigo-400" /> :
              <Music className="w-6 h-6 text-indigo-400" />}
           </div>
@@ -475,11 +788,13 @@ export default function App() {
             <h1 className="text-xl font-semibold">
               {mode === 'view_history' ? 'Track History' :
                mode === 'remove_voice' ? 'Karaoke Creator' :
+               mode === 'vocals_only' ? 'Vocal Extractor' :
                mode === 'reel' ? 'Reel Maker' : 'TuneShift Composer'}
             </h1>
             <p className="text-sm text-zinc-400">
               {mode === 'view_history' ? activeHistoryItem?.filename :
                mode === 'remove_voice' ? 'Remove vocals from your track' :
+               mode === 'vocals_only' ? 'Keep only the singer, strip the music' :
                mode === 'reel' ? 'Karaoke lyric video for Reels' : 'Extract & convert melody'}
             </p>
           </div>
@@ -532,7 +847,7 @@ export default function App() {
                   </h2>
                   
                   {!file ? (
-                    <label className="border-2 border-dashed border-zinc-700/50 hover:border-indigo-500/50 hover:bg-zinc-800/30 transition-all rounded-xl p-10 flex flex-col items-center justify-center gap-3 cursor-pointer bg-zinc-900/30 min-h-[160px]">
+                    <label className="border-2 border-dashed border-zinc-700/50 hover:border-indigo-500/50 hover:bg-zinc-800/30 transition-all rounded-xl p-6 sm:p-10 flex flex-col items-center justify-center gap-3 cursor-pointer bg-zinc-900/30 min-h-[160px]">
                       <Upload className="w-8 h-8 text-zinc-500" />
                       <div className="text-center">
                         <span className="font-medium text-indigo-400 hover:text-indigo-300 transition-colors">Select a song</span>
@@ -580,15 +895,20 @@ export default function App() {
                     <h2 className="text-sm font-semibold text-zinc-400 uppercase tracking-wider flex items-center gap-2">
                       <span className="w-2 h-2 rounded-full bg-indigo-500"></span>
                       Target Instrument
+                      {project && <span className="normal-case text-zinc-600 font-normal">— tap to try another, instantly</span>}
                     </h2>
                     <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                      {INSTRUMENTS.map((inst) => (
+                      {instrumentsList.map((inst) => (
                         <button
                           key={inst.id}
-                          onClick={() => setInstrument(inst.id)}
-                          className={`py-3 px-4 rounded-xl text-sm font-medium transition-all border ${
-                            instrument === inst.id 
-                            ? 'border-indigo-500 bg-indigo-500/10 text-indigo-300' 
+                          disabled={editing}
+                          onClick={() => {
+                            setInstrument(inst.id);
+                            if (project) applyEdit({ instrument: inst.id });
+                          }}
+                          className={`py-3 px-4 rounded-xl text-sm font-medium transition-all border disabled:opacity-50 ${
+                            instrument === inst.id
+                            ? 'border-indigo-500 bg-indigo-500/10 text-indigo-300'
                             : 'border-zinc-800/50 bg-zinc-900/30 hover:border-zinc-700 text-zinc-400'
                           }`}
                         >
@@ -756,47 +1076,107 @@ export default function App() {
                   </>
                 )}
 
-                {/* Generate Area for Remove Voice mode */}
-                {mode === 'remove_voice' && (
+                {/* Generate Area for Remove Voice / Extract Vocals modes (opposite outputs, same flow) */}
+                {(mode === 'remove_voice' || mode === 'vocals_only') && (
                   <div className="pt-4">
                     {!isGenerating && !resultUrl ? (
-                      <button 
+                      <button
                         onClick={handleGenerate}
                         disabled={!file}
-                        className="w-full bg-rose-600 hover:bg-rose-500 text-white disabled:bg-zinc-800 disabled:text-zinc-500 py-4 rounded-xl font-medium transition-all flex items-center justify-center gap-2 shadow-lg shadow-rose-500/20 disabled:shadow-none text-lg"
+                        className={`w-full text-white disabled:bg-zinc-800 disabled:text-zinc-500 py-4 rounded-xl font-medium transition-all flex items-center justify-center gap-2 shadow-lg disabled:shadow-none text-lg ${
+                          mode === 'vocals_only'
+                            ? 'bg-teal-600 hover:bg-teal-500 shadow-teal-500/20'
+                            : 'bg-rose-600 hover:bg-rose-500 shadow-rose-500/20'
+                        }`}
                       >
-                        Remove Vocals & Generate
+                        {mode === 'vocals_only' ? 'Extract Vocals & Generate' : 'Remove Vocals & Generate'}
                       </button>
                     ) : isGenerating ? (
                       <div className="space-y-4 bg-zinc-900/30 p-6 rounded-xl border border-zinc-800/50">
                         <div className="flex justify-between text-sm text-zinc-400">
-                          <span className="flex items-center gap-2"><Loader2 className="w-4 h-4 animate-spin text-rose-500" /> {jobStatus}</span>
-                          <span className="font-mono text-rose-400">{displayProgress}%</span>
+                          <span className={`flex items-center gap-2`}><Loader2 className={`w-4 h-4 animate-spin ${mode === 'vocals_only' ? 'text-teal-500' : 'text-rose-500'}`} /> {jobStatus}</span>
+                          <span className={`font-mono ${mode === 'vocals_only' ? 'text-teal-400' : 'text-rose-400'}`}>{displayProgress}%</span>
                         </div>
                         <div className="w-full h-3 bg-zinc-800 rounded-full overflow-hidden border border-zinc-700/50">
-                          <div 
-                            className="h-full bg-gradient-to-r from-rose-600 via-rose-500 to-rose-400 transition-all duration-700 ease-out shadow-[0_0_15px_rgba(244,63,94,0.5)]" 
+                          <div
+                            className={`h-full transition-all duration-700 ease-out ${
+                              mode === 'vocals_only'
+                                ? 'bg-gradient-to-r from-teal-600 via-teal-500 to-teal-400 shadow-[0_0_15px_rgba(20,184,166,0.5)]'
+                                : 'bg-gradient-to-r from-rose-600 via-rose-500 to-rose-400 shadow-[0_0_15px_rgba(244,63,94,0.5)]'
+                            }`}
                             style={{ width: `${displayProgress}%` }}
                           />
                         </div>
                         <p className="text-xs text-zinc-500 text-center animate-pulse">This usually takes 1-2 minutes depending on song length.</p>
                       </div>
                     ) : (
-                      <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500 bg-rose-500/5 p-4 rounded-xl border border-rose-500/20">
-                        <audio controls className="w-full h-10 custom-audio" src={resultUrl} />
-                        
+                      <div className={`space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500 p-4 rounded-xl border ${
+                        mode === 'vocals_only' ? 'bg-teal-500/5 border-teal-500/20' : 'bg-rose-500/5 border-rose-500/20'
+                      }`}>
+                        {karaokeTweaking && (
+                          <span className="flex items-center gap-1.5 text-xs text-indigo-400">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" /> Updating…
+                          </span>
+                        )}
+                        {!karaokeTweaking && karaokeTweakError && <p className="text-xs text-rose-400">{karaokeTweakError}</p>}
+                        <audio key={karaokeBlobUrl || resultUrl} controls className="w-full h-10 custom-audio" src={karaokeBlobUrl || resultUrl} />
+
+                        {/* Instant pitch/tempo, no need to generate again: re-uses the already separated part */}
+                        <div className="space-y-3 bg-zinc-900/30 rounded-xl p-3 border border-zinc-800/50">
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <label className="text-xs font-medium text-zinc-400">Pitch</label>
+                              <span className="text-xs bg-zinc-800 text-zinc-300 px-2 py-0.5 rounded border border-zinc-700 font-mono">
+                                {karaokePitch > 0 ? `+${karaokePitch}` : karaokePitch} semitones
+                              </span>
+                            </div>
+                            <input
+                              type="range" min="-12" max="12" step="1"
+                              value={karaokePitch}
+                              disabled={karaokeTweaking}
+                              onChange={(e) => {
+                                const pitch = parseInt(e.target.value, 10);
+                                setKaraokePitch(pitch);
+                                applyKaraokeTweakDebounced({ pitch });
+                              }}
+                              className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                            />
+                          </div>
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <label className="text-xs font-medium text-zinc-400">Tempo</label>
+                              <span className="text-xs bg-zinc-800 text-zinc-300 px-2 py-0.5 rounded border border-zinc-700 font-mono">{karaokeTempo}x</span>
+                            </div>
+                            <input
+                              type="range" min="0.5" max="2.0" step="0.1"
+                              value={karaokeTempo}
+                              disabled={karaokeTweaking}
+                              onChange={(e) => {
+                                const tempo = parseFloat(e.target.value);
+                                setKaraokeTempo(tempo);
+                                applyKaraokeTweakDebounced({ tempo });
+                              }}
+                              className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                            />
+                          </div>
+                        </div>
+
                         <div className="flex gap-3">
-                          <a 
-                            href={resultUrl}
-                            download="Instrumental_Track.mp3"
+                          <a
+                            href={karaokeBlobUrl || resultUrl}
+                            download={mode === 'vocals_only' ? 'Vocals_Only.mp3' : 'Instrumental_Track.mp3'}
                             target="_blank"
                             className="flex-1 bg-white hover:bg-zinc-200 text-zinc-900 py-3 rounded-xl font-medium transition-all flex items-center justify-center gap-2 shadow-lg"
                           >
                             <Download className="w-4 h-4" />
-                            Download Instrumental
+                            {mode === 'vocals_only' ? 'Download Vocals' : 'Download Instrumental'}
                           </a>
-                          <button 
-                            onClick={() => setResultUrl(null)}
+                          <button
+                            onClick={() => {
+                              setResultUrl(null);
+                              setKaraokeTweakError('');
+                              setKaraokeBlobUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return null; });
+                            }}
                             className="px-6 border border-zinc-700 hover:bg-zinc-800 text-zinc-300 rounded-xl font-medium transition-all"
                           >
                             New
@@ -824,10 +1204,14 @@ export default function App() {
                         <label className="text-sm font-medium text-zinc-300">Tempo</label>
                         <span className="text-xs bg-zinc-800 text-zinc-300 px-2 py-1 rounded border border-zinc-700 font-mono">{settings.tempo}x</span>
                       </div>
-                      <input 
-                        type="range" min="0.5" max="2.0" step="0.1" 
-                        value={settings.tempo} 
-                        onChange={(e) => setSettings({...settings, tempo: parseFloat(e.target.value)})}
+                      <input
+                        type="range" min="0.5" max="2.0" step="0.1"
+                        value={settings.tempo}
+                        onChange={(e) => {
+                          const tempo = parseFloat(e.target.value);
+                          setSettings({...settings, tempo});
+                          if (project) applyEditDebounced({ tempo });
+                        }}
                         className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
                       />
                     </div>
@@ -839,7 +1223,11 @@ export default function App() {
                         <p className="text-xs text-zinc-500 mt-1">Clean up small glitches from AI</p>
                       </div>
                       <label className="relative inline-flex items-center cursor-pointer">
-                        <input type="checkbox" className="sr-only peer" checked={settings.note_smoothing} onChange={(e) => setSettings({...settings, note_smoothing: e.target.checked})} />
+                        <input type="checkbox" className="sr-only peer" checked={settings.note_smoothing} onChange={(e) => {
+                          const note_smoothing = e.target.checked;
+                          setSettings({...settings, note_smoothing});
+                          if (project) applyEdit({ note_smoothing });
+                        }} />
                         <div className="w-10 h-5 bg-zinc-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-500"></div>
                       </label>
                     </div>
@@ -851,10 +1239,135 @@ export default function App() {
                         <p className="text-xs text-zinc-500 mt-1">Smooth sliding between notes</p>
                       </div>
                       <label className="relative inline-flex items-center cursor-pointer">
-                        <input type="checkbox" className="sr-only peer" checked={settings.pitch_bend} onChange={(e) => setSettings({...settings, pitch_bend: e.target.checked})} />
+                        <input type="checkbox" className="sr-only peer" checked={settings.pitch_bend} onChange={(e) => {
+                          const pitch_bend = e.target.checked;
+                          setSettings({...settings, pitch_bend});
+                          if (project) applyEdit({ pitch_bend });
+                        }} />
                         <div className="w-10 h-5 bg-zinc-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-500"></div>
                       </label>
                     </div>
+
+                    {/* Live-only tweaks: these are decided by the AI composer, so they only make sense once a version exists */}
+                    {project && (
+                      <>
+                        <div className="space-y-3 border-t border-zinc-800/50 pt-5">
+                          <div className="flex items-center justify-between">
+                            <label className="text-sm font-medium text-zinc-300">Transpose</label>
+                            <span className="text-xs bg-zinc-800 text-zinc-300 px-2 py-1 rounded border border-zinc-700 font-mono">
+                              {project.transpose > 0 ? `+${project.transpose}` : project.transpose} semitones
+                            </span>
+                          </div>
+                          <input
+                            type="range" min="-24" max="24" step="1"
+                            value={project.transpose}
+                            disabled={editing}
+                            onChange={(e) => {
+                              const transpose = parseInt(e.target.value, 10);
+                              setProject({ ...project, transpose });
+                              applyEditDebounced({ transpose });
+                            }}
+                            className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                          />
+                        </div>
+
+                        <div className="flex items-center justify-between border-t border-zinc-800/50 pt-5">
+                          <div>
+                            <label className="text-sm font-medium text-zinc-300">Accompaniment</label>
+                            <p className="text-xs text-zinc-500 mt-1">Background chords + bass</p>
+                          </div>
+                          <label className="relative inline-flex items-center cursor-pointer">
+                            <input type="checkbox" className="sr-only peer" checked={project.accompaniment} disabled={editing} onChange={(e) => applyEdit({ accompaniment: e.target.checked })} />
+                            <div className="w-10 h-5 bg-zinc-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:start-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-indigo-500"></div>
+                          </label>
+                        </div>
+
+                        {project.accompaniment && (
+                          <>
+                            <div className="border-t border-zinc-800/50 pt-5 space-y-2">
+                              <label className="text-sm font-medium text-zinc-300">Accompaniment style</label>
+                              <div className="grid grid-cols-3 gap-2">
+                                {['block', 'arpeggio', 'strum'].map((style) => (
+                                  <button
+                                    key={style}
+                                    disabled={editing}
+                                    onClick={() => applyEdit({ accompaniment_style: style })}
+                                    className={`py-2 rounded-lg text-xs font-medium border capitalize transition-all disabled:opacity-50 ${
+                                      project.accompaniment_style === style
+                                        ? 'border-indigo-500 bg-indigo-500/10 text-indigo-300'
+                                        : 'border-zinc-800/50 bg-zinc-900/30 hover:border-zinc-700 text-zinc-400'
+                                    }`}
+                                  >
+                                    {style}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+
+                            <div className="space-y-3 pt-2">
+                              <div className="flex items-center justify-between">
+                                <label className="text-sm font-medium text-zinc-300">Accompaniment volume</label>
+                                <span className="text-xs bg-zinc-800 text-zinc-300 px-2 py-1 rounded border border-zinc-700 font-mono">{Math.round(project.accompaniment_volume * 100)}%</span>
+                              </div>
+                              <input
+                                type="range" min="0" max="1" step="0.05"
+                                value={project.accompaniment_volume}
+                                disabled={editing}
+                                onChange={(e) => {
+                                  const accompaniment_volume = parseFloat(e.target.value);
+                                  setProject({ ...project, accompaniment_volume });
+                                  applyEditDebounced({ accompaniment_volume });
+                                }}
+                                className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                              />
+                            </div>
+                          </>
+                        )}
+
+                        <div className="space-y-3 border-t border-zinc-800/50 pt-5">
+                          <div className="flex items-center justify-between">
+                            <label className="text-sm font-medium text-zinc-300">Melody volume</label>
+                            <span className="text-xs bg-zinc-800 text-zinc-300 px-2 py-1 rounded border border-zinc-700 font-mono">{Math.round(project.melody_volume * 100)}%</span>
+                          </div>
+                          <input
+                            type="range" min="0" max="1" step="0.05"
+                            value={project.melody_volume}
+                            disabled={editing}
+                            onChange={(e) => {
+                              const melody_volume = parseFloat(e.target.value);
+                              setProject({ ...project, melody_volume });
+                              applyEditDebounced({ melody_volume });
+                            }}
+                            className="w-full h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+                          />
+                        </div>
+
+                        {/* AI edit: say what you want changed in plain Hindi/English/Hinglish */}
+                        <div className="space-y-2 border-t border-zinc-800/50 pt-5">
+                          <label className="text-sm font-medium text-zinc-300">Or just say what you want</label>
+                          <div className="flex gap-2">
+                            <input
+                              type="text"
+                              value={aiInstruction}
+                              disabled={editing}
+                              onChange={(e) => setAiInstruction(e.target.value)}
+                              onKeyDown={(e) => { if (e.key === 'Enter') applyAiEdit(); }}
+                              placeholder="jaise: 'thoda dheere kar do' ya 'bass halka kar do'"
+                              className="flex-1 min-w-0 bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 disabled:opacity-50"
+                            />
+                            <button
+                              onClick={applyAiEdit}
+                              disabled={editing || !aiInstruction.trim()}
+                              className="px-4 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:bg-zinc-800 disabled:text-zinc-500 text-white text-sm font-medium transition-colors flex items-center gap-1.5"
+                            >
+                              {editing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Wand2 className="w-4 h-4" />}
+                            </button>
+                          </div>
+                          {aiReply && <p className="text-xs text-emerald-400">{aiReply}</p>}
+                          {editError && <p className="text-xs text-rose-400">{editError}</p>}
+                        </div>
+                      </>
+                    )}
                   </div>
 
                   {/* Generate Area for Compose mode */}
@@ -883,11 +1396,16 @@ export default function App() {
                       </div>
                     ) : (
                       <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500 bg-indigo-500/5 p-4 rounded-xl border border-indigo-500/20">
-                        <audio controls className="w-full h-10 custom-audio" src={resultUrl} />
-                        
+                        {editing && (
+                          <span className="flex items-center gap-1.5 text-xs text-indigo-400">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" /> Updating…
+                          </span>
+                        )}
+                        <audio controls className="w-full h-10 custom-audio" src={project ? `${resultUrl}?v=${project.version}` : resultUrl} />
+
                         <div className="flex gap-3">
-                          <a 
-                            href={resultUrl}
+                          <a
+                            href={project ? `${resultUrl}?v=${project.version}` : resultUrl}
                             download="TuneShift_Result.mp3"
                             target="_blank"
                             className="flex-1 bg-white hover:bg-zinc-200 text-zinc-900 py-3 rounded-xl font-medium transition-all flex items-center justify-center gap-2 shadow-lg"
@@ -895,8 +1413,8 @@ export default function App() {
                             <Download className="w-4 h-4" />
                             Download MP3
                           </a>
-                          <button 
-                            onClick={() => setResultUrl(null)}
+                          <button
+                            onClick={() => { setResultUrl(null); setProject(null); setEditError(''); setAiReply(''); }}
                             className="px-6 border border-zinc-700 hover:bg-zinc-800 text-zinc-300 rounded-xl font-medium transition-all"
                           >
                             New

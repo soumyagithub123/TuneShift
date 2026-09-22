@@ -15,6 +15,7 @@ SOUNDFONT_DIR = BASE_DIR / "soundfonts"
 
 MAX_UPLOAD_BYTES = 15 * 1024 * 1024
 MAX_KARAOKE_BYTES = 120 * 1024 * 1024  # a full-quality stereo part, only ever sent from this machine
+MAX_VIDEO_BYTES = 500 * 1024 * 1024  # a video to take the sound from, also only ever sent from this machine
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")

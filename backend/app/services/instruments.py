@@ -10,6 +10,18 @@ INSTRUMENTS = [
     {"id": "piano", "name": "Piano", "program": 0},
     {"id": "violin", "name": "Violin", "program": 40},
     {"id": "santoor", "name": "Santoor", "program": 15},
+    {"id": "electric_guitar", "name": "Electric guitar", "program": 27},
+    {"id": "harmonium", "name": "Harmonium", "program": 20},
+    {"id": "saxophone", "name": "Saxophone", "program": 65},
+    {"id": "trumpet", "name": "Trumpet", "program": 56},
+    {"id": "cello", "name": "Cello", "program": 42},
+    {"id": "harp", "name": "Harp", "program": 46},
+    {"id": "accordion", "name": "Accordion", "program": 21},
+    {"id": "organ", "name": "Organ", "program": 19},
+    {"id": "marimba", "name": "Marimba", "program": 12},
+    {"id": "kalimba", "name": "Kalimba", "program": 108},
+    {"id": "clarinet", "name": "Clarinet", "program": 71},
+    {"id": "electric_piano", "name": "Electric piano", "program": 4},
 ]
 
 _BY_ID = {i["id"]: i for i in INSTRUMENTS}

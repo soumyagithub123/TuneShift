@@ -17,3 +17,20 @@ def karaoke_source(work: Path) -> Path:
 def instrumental_path(work: Path) -> Path:
     """The music-only stem that voice removal writes for this job."""
     return work / "karaoke" / "demucs" / "htdemucs" / "part" / "no_vocals.wav"
+
+
+def karaoke_stem_path(work: Path, mode: str) -> Path | None:
+    """Where remove_voice/vocals_only keep their separated part, for later pitch/tempo tweaks."""
+    base = work / "demucs" / "htdemucs" / "trimmed"
+    if mode == "vocals_only":
+        return base / "vocals.wav"
+    if mode == "remove_voice":
+        return base / "no_vocals.wav"
+    return None
+
+
+def separate_stems(input_wav: Path, out_dir: Path) -> dict[str, Path]:
+    """Split a song into drums, bass, other (guitars, keys, ...) and vocals."""
+    run([sys.executable, "-m", "demucs", "-n", "htdemucs", str(input_wav), "-o", str(out_dir)])
+    folder = out_dir / "htdemucs" / input_wav.stem
+    return {name: folder / f"{name}.wav" for name in ("drums", "bass", "other", "vocals")}

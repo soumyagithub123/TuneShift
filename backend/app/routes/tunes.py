@@ -5,14 +5,15 @@ from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
+from pydub import AudioSegment, effects
 from starlette.background import BackgroundTask
 
-from app.config import MAX_KARAOKE_BYTES, MAX_UPLOAD_BYTES, OUTPUT_DIR, UPLOAD_DIR, WORK_DIR
+from app.config import MAX_KARAOKE_BYTES, MAX_UPLOAD_BYTES, MAX_VIDEO_BYTES, OUTPUT_DIR, UPLOAD_DIR, WORK_DIR
 from app.schemas import (
-    AiEditRequest, AiEditResponse, EditOps, HookCandidate, ImagePromptRequest, Instrument, JobStatus, LyricLine, Project,
-    RenderReelRequest, TuneSettings,
+    AiEditRequest, AiEditResponse, EditOps, HookCandidate, ImagePromptRequest, Instrument, JobStatus, KaraokeTweakRequest,
+    LyricLine, Project, RenameJobRequest, RenderReelRequest, TuneSettings, VoiceCharacter,
 )
-from app.services import assemble, edit, hook, images, instruments, llm, lyrics, reel, db, separation, storage
+from app.services import assemble, audio, edit, hook, images, instruments, llm, lyrics, reel, db, separation, storage, voice
 from app.services import project as project_store
 from app.services.pipeline import run_pipeline
 from app.services.shell import run
@@ -89,9 +90,37 @@ async def list_instruments():
     return instruments.INSTRUMENTS
 
 
+@router.get("/characters", response_model=list[VoiceCharacter])
+async def list_characters():
+    return voice.CHARACTERS
+
+
 @router.get("/history")
 async def get_history():
     return await db.get_history()
+
+
+@router.patch("/history/{job_id}")
+async def rename_history_item(job_id: str, body: RenameJobRequest):
+    if not await db.get_job(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    await db.rename_job(job_id, body.filename.strip())
+    return {"ok": True}
+
+
+@router.delete("/history/{job_id}")
+async def delete_history_item(job_id: str):
+    if not await db.get_job(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    await db.delete_job(job_id)
+    try:
+        job_uuid = uuid.UUID(job_id)
+        (OUTPUT_DIR / f"{job_uuid}.mp3").unlink(missing_ok=True)
+        (OUTPUT_DIR / f"{job_uuid}.mp4").unlink(missing_ok=True)
+        shutil.rmtree(project_store.job_dir(job_id), ignore_errors=True)
+    except ValueError:
+        pass
+    return {"ok": True}
 
 
 @router.post("/generate", response_model=JobStatus)
@@ -107,9 +136,20 @@ async def generate_tune(
     mode: str = Form("compose"),
     language: str = Form("hi"),
     isolate_vocals: bool = Form(False),
+    keep_drums: bool = Form(True),
+    keep_bass: bool = Form(True),
+    keep_vocals: bool = Form(False),
+    lofi_speed: float = Form(0.88),
+    lofi_vinyl: bool = Form(True),
+    lofi_reverb: bool = Form(True),
+    lofi_remove_vocals: bool = Form(False),
+    voice_character: str = Form("chipmunk"),
     image: UploadFile | None = File(None),
 ):
-    if not instruments.is_valid(instrument):
+    if mode == "voice":
+        if not voice.is_valid(voice_character):
+            raise HTTPException(status_code=400, detail=f"Unknown character '{voice_character}'.")
+    elif not instruments.is_valid(instrument):
         raise HTTPException(status_code=400, detail=f"Unknown instrument '{instrument}'.")
     if file.size is not None and file.size > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=400, detail=f"File too large. Max {MAX_UPLOAD_BYTES // (1024 * 1024)}MB.")
@@ -125,6 +165,10 @@ async def generate_tune(
         settings = TuneSettings(
             note_smoothing=note_smoothing, pitch_bend=pitch_bend, tempo=tempo, mode=mode,
             isolate_vocals=isolate_vocals,
+            keep_drums=keep_drums, keep_bass=keep_bass, keep_vocals=keep_vocals,
+            lofi_speed=lofi_speed, lofi_vinyl=lofi_vinyl, lofi_reverb=lofi_reverb,
+            lofi_remove_vocals=lofi_remove_vocals,
+            voice_character=voice_character,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -155,6 +199,27 @@ async def get_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return JobStatus(job_id=job_id, status=job["status"], message=job["message"])
+
+
+@router.post("/tunes/{job_id}/tweak")
+def tweak_karaoke(job_id: str, body: KaraokeTweakRequest):
+    """Re-render a finished Remove Voice / Extract Vocals job at a new pitch/tempo. The separated
+    part is still on disk from the first run, so this skips separation and is quick."""
+    try:
+        work = project_store.job_dir(job_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Job not found")
+    source = separation.karaoke_stem_path(work, body.mode)
+    if source is None or not source.exists():
+        raise HTTPException(status_code=404, detail="This part was not found. Generate it again.")
+    try:
+        tweaked_wav = work / f"tweak_{body.mode}.wav"
+        audio.pitch_tempo_shift(source, tweaked_wav, body.pitch, body.tempo)
+        out_mp3 = work / f"tweak_{body.mode}.mp3"
+        effects.normalize(AudioSegment.from_file(str(tweaked_wav)), headroom=1.0).export(str(out_mp3), format="mp3")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not change the pitch/tempo: {e}")
+    return FileResponse(out_mp3, media_type="audio/mpeg", filename="Tweaked.mp3", headers={"Cache-Control": "no-store"})
 
 
 @router.get("/projects/{job_id}", response_model=Project)
@@ -234,6 +299,42 @@ def convert_clip(video: UploadFile = File(...)):
     # The clip is not kept: the temporary folder is deleted once the file has been sent.
     return FileResponse(
         out, media_type="video/mp4", filename="lyrics_clip.mp4",
+        background=BackgroundTask(shutil.rmtree, work, ignore_errors=True),
+    )
+
+
+# Output format -> (file extension, media type, ffmpeg arguments for the sound)
+AUDIO_FORMATS = {
+    "mp3": ("mp3", "audio/mpeg", ["-c:a", "libmp3lame", "-q:a", "2"]),
+    "wav": ("wav", "audio/wav", ["-c:a", "pcm_s16le"]),
+    "m4a": ("m4a", "audio/mp4", ["-c:a", "aac", "-b:a", "192k"]),
+}
+
+
+@router.post("/audio/extract")
+def extract_audio(video: UploadFile = File(...), format: str = Form("mp3")):
+    """Take the sound out of a video (MP4, MOV, WebM, ...) as an MP3, WAV or M4A file."""
+    if format not in AUDIO_FORMATS:
+        raise HTTPException(status_code=400, detail=f"Unknown format '{format}'. Use mp3, wav or m4a.")
+    if video.size is not None and video.size > MAX_VIDEO_BYTES:
+        raise HTTPException(status_code=400, detail=f"Video too large. Max {MAX_VIDEO_BYTES // (1024 * 1024)}MB.")
+    ext, media_type, codec_args = AUDIO_FORMATS[format]
+    work = WORK_DIR / "extract" / str(uuid.uuid4())
+    work.mkdir(parents=True, exist_ok=True)
+    try:
+        source = work / "video"
+        with open(source, "wb") as buffer:
+            shutil.copyfileobj(video.file, buffer)
+        out = work / f"audio.{ext}"
+        run(["ffmpeg", "-y", "-i", str(source), "-vn", "-map", "0:a:0", *codec_args, str(out)])
+    except Exception as e:
+        shutil.rmtree(work, ignore_errors=True)
+        if "matches no streams" in str(e):
+            raise HTTPException(status_code=400, detail="This video has no sound to take out.")
+        raise HTTPException(status_code=500, detail=f"Could not take the sound out: {e}")
+    # Not kept: the temporary folder is deleted once the file has been sent.
+    return FileResponse(
+        out, media_type=media_type, filename=f"{Path(video.filename or 'audio').stem}.{ext}",
         background=BackgroundTask(shutil.rmtree, work, ignore_errors=True),
     )
 

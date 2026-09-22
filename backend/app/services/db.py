@@ -35,6 +35,14 @@ async def get_job(job_id: str):
         doc["_id"] = str(doc["_id"])
     return doc
 
+async def delete_job(job_id: str):
+    await jobs_collection.delete_one({"job_id": job_id})
+
+
+async def rename_job(job_id: str, filename: str):
+    await jobs_collection.update_one({"job_id": job_id}, {"$set": {"filename": filename}})
+
+
 async def get_history():
     # Lyrics-only jobs are throw-away results, not something to list in history.
     cursor = jobs_collection.find({"mode": {"$ne": "lyrics"}}).sort("created_at", -1)

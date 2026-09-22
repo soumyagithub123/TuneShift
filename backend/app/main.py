@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import ALLOWED_ORIGINS
-from app.routes import tunes
+from app.routes import remix, tunes
 
 app = FastAPI(title="TuneShift API")
 
@@ -18,3 +18,4 @@ def validate_file_size(file):
         raise HTTPException(status_code=400, detail="File too large. Max 50MB.")
 
 app.include_router(tunes.router)
+app.include_router(remix.router)
