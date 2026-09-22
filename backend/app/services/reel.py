@@ -13,7 +13,7 @@ SIZES = {"9:16": (1080, 1920), "4:5": (1080, 1350), "1:1": (1080, 1080), "16:9":
 POSITIONS = ("top", "middle", "bottom")
 STYLES = ("highlight", "plain")  # highlight: each word lights up as it is sung
 DEFAULT_SIZE = SIZES["9:16"]
-FONT = "Nirmala UI"  # ships with Windows; covers Devanagari and Latin
+FONT = "DejaVu Sans"  # available on Linux (Render); covers Latin and many scripts
 
 
 def _ass_time(t: float) -> str:

@@ -23,9 +23,12 @@ def run_pipeline(
     image_path: str | None = None,
     language: str | None = "hi",
 ) -> Path:
-    instruments.soundfont_for(instrument)
     work = project_store.job_dir(job_id)
     work.mkdir(parents=True, exist_ok=True)
+    # Only compose mode needs a soundfont — checking early for a clear error message.
+    if settings.mode not in ("remove_voice", "vocals_only", "reel", "lyrics", "swap", "lofi", "voice"):
+        instruments.soundfont_for(instrument)
+
 
     on_status("Trimming audio...")
     trimmed = work / "trimmed.wav"
