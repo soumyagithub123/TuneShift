@@ -5,7 +5,7 @@ from app.services.shell import run
 
 
 def separate_vocals(input_wav: Path, out_dir: Path) -> Path:
-    run([sys.executable, "-m", "demucs", "-n", "mdx_q", "--two-stems=vocals", str(input_wav), "-o", str(out_dir)])
+    run([sys.executable, "-m", "demucs", "-n", "mdx_q", "--segment", "7", "--two-stems=vocals", str(input_wav), "-o", str(out_dir)])
     return out_dir / "mdx_q" / input_wav.stem / "vocals.wav"
 
 
@@ -31,6 +31,6 @@ def karaoke_stem_path(work: Path, mode: str) -> Path | None:
 
 def separate_stems(input_wav: Path, out_dir: Path) -> dict[str, Path]:
     """Split a song into drums, bass, other (guitars, keys, ...) and vocals."""
-    run([sys.executable, "-m", "demucs", "-n", "mdx_q", str(input_wav), "-o", str(out_dir)])
+    run([sys.executable, "-m", "demucs", "-n", "mdx_q", "--segment", "7", str(input_wav), "-o", str(out_dir)])
     folder = out_dir / "mdx_q" / input_wav.stem
     return {name: folder / f"{name}.wav" for name in ("drums", "bass", "other", "vocals")}
